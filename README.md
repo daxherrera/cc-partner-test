@@ -88,6 +88,10 @@ control, or a reserved ngrok domain like `yourname.ngrok.app`.
   make — profile, cards, shipping addresses, outbound shipments, plus
   example mutations (update bio, add a shipping address). Admin / shipper /
   vault routes are deliberately blocked for partner users by CC's backend.
+- **Section 5 — Redeem cards**: enter comma-separated NFT addresses and a
+  shipping address ID, hit "Prepare redemption" — calls
+  `POST /redeem/prepare` and surfaces the unsigned transactions so you can
+  inspect the response shape before integrating signing.
 
 ## Redeeming cards (the burn flow)
 

@@ -55,6 +55,8 @@ export default function Page() {
   const [connectError, setConnectError] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [result, setResult] = useState<CallResult>({ status: 'idle' });
+  const [nftAddressesInput, setNftAddressesInput] = useState('');
+  const [shippingAddressId, setShippingAddressId] = useState('');
 
   const callCC = useCallback(
     async (label: string, path: string, init?: RequestInit) => {
@@ -341,7 +343,101 @@ export default function Page() {
         )}
       </Section>
 
-      <Section title='5. Result'>
+      <Section title='5. Redeem cards (composite burn-prepare)'>
+        {!ccUser && (
+          <div style={{ color: '#6b7280' }}>Connect first.</div>
+        )}
+        {ccUser && (
+          <>
+            <p style={{ color: '#9ca3af', marginTop: 0 }}>
+              Calls{' '}
+              <code>POST /redeem/prepare</code> — the one-shot composite that
+              creates an outbound shipment in <code>Created</code> status and
+              returns unsigned burn transactions for you to sign. The user&apos;s
+              wallet must own each NFT and hold enough USDC to cover{' '}
+              <code>totalCost</code>; the burn transactions atomically transfer
+              shipping payment alongside the burn.
+            </p>
+            <div style={{ marginBottom: 12 }}>
+              <label
+                style={{
+                  color: '#9ca3af',
+                  display: 'block',
+                  fontSize: 13,
+                  marginBottom: 4,
+                }}
+              >
+                NFT addresses (comma-separated)
+              </label>
+              <textarea
+                value={nftAddressesInput}
+                onChange={e => setNftAddressesInput(e.target.value)}
+                placeholder='So1aMint1…, So1aMint2…'
+                rows={3}
+                style={{
+                  background: '#0b0b0f',
+                  border: '1px solid #27272e',
+                  borderRadius: 6,
+                  color: '#e5e7eb',
+                  fontFamily: 'ui-monospace, monospace',
+                  fontSize: 13,
+                  padding: '8px 10px',
+                  width: '100%',
+                }}
+              />
+            </div>
+            <div style={{ marginBottom: 12 }}>
+              <label
+                style={{
+                  color: '#9ca3af',
+                  display: 'block',
+                  fontSize: 13,
+                  marginBottom: 4,
+                }}
+              >
+                Shipping address ID (run{' '}
+                <code>GET /shipping-address</code> in section 4 to find one)
+              </label>
+              <input
+                value={shippingAddressId}
+                onChange={e => setShippingAddressId(e.target.value)}
+                placeholder='shippingAddr_…'
+                style={{
+                  background: '#0b0b0f',
+                  border: '1px solid #27272e',
+                  borderRadius: 6,
+                  color: '#e5e7eb',
+                  fontFamily: 'ui-monospace, monospace',
+                  fontSize: 13,
+                  minWidth: 320,
+                  padding: '8px 10px',
+                  width: '100%',
+                }}
+              />
+            </div>
+            <Button
+              onClick={() => {
+                const nftAddresses = nftAddressesInput
+                  .split(/[\s,]+/)
+                  .map(s => s.trim())
+                  .filter(Boolean);
+                callCC('POST /redeem/prepare', '/redeem/prepare', {
+                  method: 'POST',
+                  body: JSON.stringify({
+                    nftAddresses,
+                    shippingAddressId,
+                    coin: 'USDC',
+                  }),
+                });
+              }}
+            >
+              Prepare redemption
+            </Button>
+          </>
+        )}
+      </Section>
+
+      <Section title='6. Result'>
         <ResultView result={result} />
       </Section>
     </Shell>
