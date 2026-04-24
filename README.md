@@ -89,6 +89,82 @@ control, or a reserved ngrok domain like `yourname.ngrok.app`.
   example mutations (update bio, add a shipping address). Admin / shipper /
   vault routes are deliberately blocked for partner users by CC's backend.
 
+## Redeeming cards (the burn flow)
+
+CC's "burn" / redemption flow takes NFTs out of circulation and ships the
+physical card to the user's mailing address. Partners drive this with a
+**single composite endpoint** plus standard wallet signing.
+
+### Two-call partner contract
+
+```
+[Partner frontend]
+   │ POST /redeem/prepare
+   │ Authorization: Bearer <partner identity token>
+   │ {
+   │   "nftAddresses": ["…"],          // canonical chain identifiers
+   │   "shippingAddressId": "shippingAddr_…",
+   │   "coin": "USDC",                  // optional, default USDC
+   │   "deliveryCompany": "ups",        // optional
+   │   "insurance": false               // optional, default false
+   │ }
+   ▼
+[CC backend]
+   │ verifies user owns each nftAddress
+   │ creates an outboundShipment in `Created` status
+   │ builds unsigned burn transactions (USDC payment + NFT burn, atomic)
+   ▼
+{
+  "outboundShipmentId": "shipment_…",
+  "transactions": ["<base64>", …],            // Solana
+  "evmTransactions": [{"chainId":…,"txs":[…]}], // EVM (if applicable)
+  "totalCost": "12.50",
+  "submitUrl": "/blockchain/shipment_…/burn"
+}
+   │
+   │ partner signs locally with the user's Privy wallet
+   │ (Solana: PrivySolanaWallet.signTransaction; EVM: signTransaction)
+   ▼
+[Partner frontend]
+   │ POST /blockchain/:outboundShipmentId/burn
+   │ Authorization: Bearer <partner identity token>
+   │ {
+   │   "transactions": ["<signed base64>", …],
+   │   "evmTransactions": [{ chainId, txs: [<signed>] }]
+   │ }
+   ▼
+[CC backend]
+   │ broadcasts on-chain
+   │ webhooks settle, cards marked Burned
+   │ ShipStation fulfillment proceeds — physical cards mailed to the
+   │ shipping address from `/shipping-address`
+```
+
+### What's required of the user
+
+- They must own the cards on-chain (in the wallet that's on their CC user
+  row — same wallet you set up via the partner identity-token flow above).
+- They must have a `ShippingAddress` row — create one with
+  `POST /shipping-address/create` before calling `/redeem/prepare`.
+- They must have enough `coin` (e.g. USDC) in their wallet to cover
+  `totalCost` — the burn transactions transfer the shipping fee
+  atomically with the NFT burn. **The user pays shipping**; CC does not
+  subsidize.
+
+### Notes
+
+- The `outboundShipment` is created in the same `Created` status native CC
+  checkouts use, so partner redemptions flow through identical webhooks,
+  emails, and ShipStation fulfillment downstream. No partner-specific
+  pipeline.
+- If your call returns `evmTransactions` for chains the user hasn't
+  configured a wallet on, you'll need their EVM wallet on the partner
+  Privy app. CC reads `evmWallet` from the partner identity token's
+  `linked_accounts`.
+- Coinflow card payments are CC's web flow only; partners shouldn't call
+  `/blockchain/:id/pay/card`. Stick to the `crypto` payment path described
+  here.
+
 ## Onboarding with CollectorCrypt
 
 Send CC the following:
