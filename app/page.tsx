@@ -2,6 +2,9 @@
 
 import { useIdentityToken, usePrivy } from '@privy-io/react-auth';
 import { useCallback, useState } from 'react';
+import { CcAsset, fetchCcAssets } from './helius';
+
+const heliusApiKey = process.env.NEXT_PUBLIC_HELIUS_API_KEY ?? '';
 
 const apiUrl = (
   process.env.NEXT_PUBLIC_CC_API_URL ?? 'https://dev-api.collectorcrypt.com'
@@ -57,6 +60,12 @@ export default function Page() {
   const [result, setResult] = useState<CallResult>({ status: 'idle' });
   const [nftAddressesInput, setNftAddressesInput] = useState('');
   const [shippingAddressId, setShippingAddressId] = useState('');
+  const [assets, setAssets] = useState<CcAsset[] | null>(null);
+  const [assetsLoading, setAssetsLoading] = useState(false);
+  const [assetsError, setAssetsError] = useState<string | null>(null);
+  const [selectedAssetIds, setSelectedAssetIds] = useState<Set<string>>(
+    new Set(),
+  );
 
   const callCC = useCallback(
     async (label: string, path: string, init?: RequestInit) => {
@@ -115,6 +124,48 @@ export default function Page() {
       setConnecting(false);
     }
   }, [identityToken]);
+
+  const loadAssets = useCallback(async () => {
+    if (!heliusApiKey) {
+      setAssetsError(
+        'NEXT_PUBLIC_HELIUS_API_KEY is not set. Add a Helius key to .env.local to enable wallet lookup.',
+      );
+      return;
+    }
+    const wallet = (
+      user?.linkedAccounts?.find(
+        (a: any) => a.type === 'wallet' && a.chainType === 'solana',
+      ) as { address?: string } | undefined
+    )?.address;
+    if (!wallet) {
+      setAssetsError('No Solana wallet on this Privy session.');
+      return;
+    }
+    setAssetsLoading(true);
+    setAssetsError(null);
+    try {
+      const found = await fetchCcAssets(heliusApiKey, wallet);
+      setAssets(found);
+      setSelectedAssetIds(new Set());
+    } catch (err) {
+      setAssetsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAssetsLoading(false);
+    }
+  }, [user]);
+
+  const toggleAssetSelected = useCallback((id: string) => {
+    setSelectedAssetIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const useSelectedForRedemption = useCallback(() => {
+    setNftAddressesInput(Array.from(selectedAssetIds).join(',\n'));
+  }, [selectedAssetIds]);
 
   const reset = useCallback(() => {
     setCcUser(null);
@@ -358,6 +409,139 @@ export default function Page() {
               <code>totalCost</code>; the burn transactions atomically transfer
               shipping payment alongside the burn.
             </p>
+            <div
+              style={{
+                background: '#0b0b0f',
+                border: '1px solid #27272e',
+                borderRadius: 8,
+                marginBottom: 16,
+                padding: 12,
+              }}
+            >
+              <div
+                style={{
+                  alignItems: 'center',
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: 12,
+                  marginBottom: 8,
+                }}
+              >
+                <strong style={{ color: '#e5e7eb', fontSize: 14 }}>
+                  Find your CC NFTs (Helius DAS)
+                </strong>
+                <Button
+                  onClick={loadAssets}
+                  variant='secondary'
+                  style={{ fontSize: 13, padding: '6px 12px' }}
+                >
+                  {assetsLoading ? 'Loading…' : assets ? 'Refresh' : 'Load'}
+                </Button>
+                {selectedAssetIds.size > 0 && (
+                  <Button
+                    onClick={useSelectedForRedemption}
+                    style={{ fontSize: 13, padding: '6px 12px' }}
+                  >
+                    Use {selectedAssetIds.size} selected ↓
+                  </Button>
+                )}
+              </div>
+              <div style={{ color: '#6b7280', fontSize: 12, marginBottom: 8 }}>
+                Filters by CC&apos;s collection groupings (
+                <code>CCryptWBYkt…</code> for Metaplex,{' '}
+                <code>CCryptUfeFSZ…</code> for Core). Includes both standard
+                NFTs and cNFTs.
+              </div>
+              {assetsError && (
+                <div style={{ color: '#f87171', fontSize: 13 }}>
+                  {assetsError}
+                </div>
+              )}
+              {assets && assets.length === 0 && !assetsError && (
+                <div style={{ color: '#9ca3af', fontSize: 13 }}>
+                  No CC NFTs in this wallet.
+                </div>
+              )}
+              {assets && assets.length > 0 && (
+                <div
+                  style={{
+                    display: 'grid',
+                    gap: 8,
+                    gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
+                    maxHeight: 320,
+                    overflowY: 'auto',
+                  }}
+                >
+                  {assets.map(asset => {
+                    const checked = selectedAssetIds.has(asset.id);
+                    return (
+                      <label
+                        key={asset.id}
+                        style={{
+                          alignItems: 'center',
+                          background: checked ? '#1e1b4b' : '#14141a',
+                          border: `1px solid ${checked ? '#676FFF' : '#27272e'}`,
+                          borderRadius: 6,
+                          cursor: 'pointer',
+                          display: 'flex',
+                          gap: 8,
+                          padding: 8,
+                        }}
+                      >
+                        <input
+                          type='checkbox'
+                          checked={checked}
+                          onChange={() => toggleAssetSelected(asset.id)}
+                        />
+                        {asset.imageUrl && (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img
+                            src={asset.imageUrl}
+                            alt=''
+                            style={{
+                              borderRadius: 4,
+                              flexShrink: 0,
+                              height: 48,
+                              objectFit: 'cover',
+                              width: 48,
+                            }}
+                          />
+                        )}
+                        <div style={{ minWidth: 0 }}>
+                          <div
+                            style={{
+                              color: '#e5e7eb',
+                              fontSize: 13,
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap',
+                            }}
+                          >
+                            {asset.name}
+                          </div>
+                          <div style={{ color: '#9ca3af', fontSize: 11 }}>
+                            {asset.compressed ? 'cNFT' : 'NFT'} ·{' '}
+                            {asset.collection}
+                          </div>
+                          <div
+                            style={{
+                              color: '#6b7280',
+                              fontFamily: 'ui-monospace, monospace',
+                              fontSize: 11,
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap',
+                            }}
+                          >
+                            {asset.id}
+                          </div>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
             <div style={{ marginBottom: 12 }}>
               <label
                 style={{
@@ -367,7 +551,8 @@ export default function Page() {
                   marginBottom: 4,
                 }}
               >
-                NFT addresses (comma-separated)
+                NFT addresses (comma-separated) — auto-filled by &quot;Use
+                selected&quot; above, or paste manually
               </label>
               <textarea
                 value={nftAddressesInput}
