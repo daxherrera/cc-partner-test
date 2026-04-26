@@ -1,12 +1,63 @@
 'use client';
 
 import { useIdentityToken, usePrivy } from '@privy-io/react-auth';
-import { useCallback, useState } from 'react';
+import { useSignTransaction, useWallets } from '@privy-io/react-auth/solana';
+import { useCallback, useEffect, useState } from 'react';
 import { CcAsset, fetchCcAssets } from './helius';
 
 const heliusApiKey = process.env.NEXT_PUBLIC_HELIUS_API_KEY ?? '';
 const solanaNetwork: 'mainnet' | 'devnet' =
   process.env.NEXT_PUBLIC_SOLANA_NETWORK === 'mainnet' ? 'mainnet' : 'devnet';
+// Mainnet USDC by default; override for devnet test mints if your dev
+// environment doesn't use mainnet USDC.
+const usdcMint =
+  process.env.NEXT_PUBLIC_USDC_MINT ??
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+const heliusRpcUrl = (): string =>
+  `https://${solanaNetwork}.helius-rpc.com/?api-key=${encodeURIComponent(
+    heliusApiKey,
+  )}`;
+
+async function fetchUsdcBalance(wallet: string): Promise<number> {
+  if (!heliusApiKey)
+    throw new Error('NEXT_PUBLIC_HELIUS_API_KEY is not set');
+  const res = await fetch(heliusRpcUrl(), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 'cc-usdc-balance',
+      method: 'getTokenAccountsByOwner',
+      params: [
+        wallet,
+        { mint: usdcMint },
+        { encoding: 'jsonParsed' },
+      ],
+    }),
+  });
+  if (!res.ok) throw new Error(`Helius ${res.status}: ${await res.text()}`);
+  const json = await res.json();
+  const accounts = json?.result?.value ?? [];
+  let total = 0;
+  for (const acc of accounts) {
+    const ui = acc?.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
+    if (typeof ui === 'number') total += ui;
+  }
+  return total;
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+function bytesToBase64(bytes: Uint8Array): string {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
 
 const apiUrl = (
   process.env.NEXT_PUBLIC_CC_API_URL ?? 'https://dev-api.collectorcrypt.com'
@@ -55,6 +106,8 @@ async function parseBody(res: Response): Promise<unknown> {
 export default function Page() {
   const { ready, authenticated, user, login, logout } = usePrivy();
   const { identityToken } = useIdentityToken();
+  const { wallets: solanaWallets } = useWallets();
+  const { signTransaction } = useSignTransaction();
 
   const [ccUser, setCcUser] = useState<CCUser | null>(null);
   const [connectError, setConnectError] = useState<string | null>(null);
@@ -68,6 +121,15 @@ export default function Page() {
   const [selectedAssetIds, setSelectedAssetIds] = useState<Set<string>>(
     new Set(),
   );
+  const [usdcBalance, setUsdcBalance] = useState<number | null>(null);
+  const [usdcError, setUsdcError] = useState<string | null>(null);
+  const [preparedRedemption, setPreparedRedemption] = useState<{
+    outboundShipmentId: string;
+    transactions?: string[];
+    evmTransactions?: unknown[];
+    totalCost?: string;
+  } | null>(null);
+  const [signingSubmit, setSigningSubmit] = useState(false);
 
   const callCC = useCallback(
     async (label: string, path: string, init?: RequestInit) => {
@@ -169,6 +231,132 @@ export default function Page() {
     setNftAddressesInput(Array.from(selectedAssetIds).join(',\n'));
   }, [selectedAssetIds]);
 
+  const loadUsdcBalance = useCallback(async () => {
+    const wallet = (
+      user?.linkedAccounts?.find(
+        (a: any) => a.type === 'wallet' && a.chainType === 'solana',
+      ) as { address?: string } | undefined
+    )?.address;
+    if (!wallet) return;
+    setUsdcError(null);
+    try {
+      const balance = await fetchUsdcBalance(wallet);
+      setUsdcBalance(balance);
+    } catch (err) {
+      setUsdcError(err instanceof Error ? err.message : String(err));
+      setUsdcBalance(null);
+    }
+  }, [user]);
+
+  const prepareRedemption = useCallback(async () => {
+    setPreparedRedemption(null);
+    const nftAddresses = nftAddressesInput
+      .split(/[\s,]+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    const res = await callCC('POST /redeem/prepare', '/redeem/prepare', {
+      method: 'POST',
+      body: JSON.stringify({
+        nftAddresses,
+        shippingAddressId,
+        coin: 'USDC',
+      }),
+    });
+    if (res?.ok && typeof res.body === 'object' && res.body) {
+      setPreparedRedemption(res.body as never);
+    }
+  }, [callCC, nftAddressesInput, shippingAddressId]);
+
+  const signAndSubmitRedemption = useCallback(async () => {
+    if (!preparedRedemption) return;
+    const { outboundShipmentId, transactions, evmTransactions } =
+      preparedRedemption;
+    if (evmTransactions && evmTransactions.length > 0) {
+      setResult({
+        status: 'error',
+        label: 'sign-and-submit',
+        message:
+          'EVM transactions detected — this demo only signs Solana. Use the Privy EVM signing hooks to handle the evmTransactions array.',
+      });
+      return;
+    }
+    if (!transactions || transactions.length === 0) {
+      setResult({
+        status: 'error',
+        label: 'sign-and-submit',
+        message: 'No transactions to sign in the prepare response.',
+      });
+      return;
+    }
+    const wallet = solanaWallets?.[0];
+    if (!wallet) {
+      setResult({
+        status: 'error',
+        label: 'sign-and-submit',
+        message:
+          'No connected Solana wallet on this Privy session. Log out and back in via the embedded wallet flow.',
+      });
+      return;
+    }
+    setSigningSubmit(true);
+    setResult({
+      status: 'pending',
+      label: `sign ${transactions.length} tx + submit`,
+    });
+    try {
+      const signedB64: string[] = [];
+      for (const tx of transactions) {
+        const { signedTransaction } = await signTransaction({
+          transaction: base64ToBytes(tx),
+          wallet,
+        });
+        signedB64.push(bytesToBase64(signedTransaction));
+      }
+      const submitRes = await fetch(
+        `${apiUrl}/blockchain/${outboundShipmentId}/burn`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${identityToken}`,
+          },
+          body: JSON.stringify({ transactions: signedB64 }),
+        },
+      );
+      const submitBody = await parseBody(submitRes);
+      setResult({
+        status: 'done',
+        label: 'POST /blockchain/:id/burn',
+        httpStatus: submitRes.status,
+        ok: submitRes.ok,
+        body: submitBody,
+      });
+      if (submitRes.ok) setPreparedRedemption(null);
+    } catch (err) {
+      setResult({
+        status: 'error',
+        label: 'sign-and-submit',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setSigningSubmit(false);
+    }
+  }, [
+    identityToken,
+    preparedRedemption,
+    signTransaction,
+    solanaWallets,
+  ]);
+
+  const deleteShippingAddress = useCallback(() => {
+    if (!shippingAddressId.trim()) return;
+    callCC(
+      `DELETE /shipping-address/${shippingAddressId}`,
+      `/shipping-address/${encodeURIComponent(shippingAddressId.trim())}`,
+      { method: 'DELETE' },
+    );
+  }, [callCC, shippingAddressId]);
+
   const reset = useCallback(() => {
     setCcUser(null);
     setConnectError(null);
@@ -179,6 +367,11 @@ export default function Page() {
     reset();
     await logout();
   }, [logout, reset]);
+
+  // Auto-fetch USDC balance once we know who the user is.
+  useEffect(() => {
+    if (ccUser) loadUsdcBalance();
+  }, [ccUser, loadUsdcBalance]);
 
   if (!ready) return <Shell>Booting Privy…</Shell>;
 
@@ -230,6 +423,16 @@ export default function Page() {
         <Row label='DID' value={user?.id ?? '—'} />
         <Row label='Email' value={userEmail} />
         <Row label='Solana wallet' value={solanaWallet?.address ?? '—'} />
+        <Row
+          label={`USDC balance (${solanaNetwork})`}
+          value={
+            usdcError
+              ? `error: ${usdcError}`
+              : usdcBalance === null
+                ? '—'
+                : `${usdcBalance.toFixed(6)} USDC`
+          }
+        />
       </Section>
 
       <Section title='2. Identity token (the Bearer we send)'>
@@ -396,6 +599,12 @@ export default function Page() {
                 }
               >
                 Add a shipping address
+              </Button>
+              <Button
+                onClick={deleteShippingAddress}
+                variant='secondary'
+              >
+                Delete shipping address (uses ID below)
               </Button>
             </div>
           </>
@@ -608,24 +817,41 @@ export default function Page() {
                 }}
               />
             </div>
-            <Button
-              onClick={() => {
-                const nftAddresses = nftAddressesInput
-                  .split(/[\s,]+/)
-                  .map(s => s.trim())
-                  .filter(Boolean);
-                callCC('POST /redeem/prepare', '/redeem/prepare', {
-                  method: 'POST',
-                  body: JSON.stringify({
-                    nftAddresses,
-                    shippingAddressId,
-                    coin: 'USDC',
-                  }),
-                });
-              }}
-            >
-              Prepare redemption
-            </Button>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
+              <Button onClick={prepareRedemption}>Prepare redemption</Button>
+              {preparedRedemption && (
+                <Button
+                  onClick={signAndSubmitRedemption}
+                  variant='secondary'
+                >
+                  {signingSubmit
+                    ? 'Signing & submitting…'
+                    : `Sign & submit (${
+                        preparedRedemption.transactions?.length ?? 0
+                      } tx → /blockchain/${
+                        preparedRedemption.outboundShipmentId.slice(0, 8)
+                      }…/burn)`}
+                </Button>
+              )}
+            </div>
+            {preparedRedemption && (
+              <p
+                style={{
+                  color: '#9ca3af',
+                  fontSize: 12,
+                  marginBottom: 0,
+                  marginTop: 8,
+                }}
+              >
+                Prepared shipment{' '}
+                <code>{preparedRedemption.outboundShipmentId}</code> · cost{' '}
+                <code>{preparedRedemption.totalCost ?? '—'} USDC</code>. The
+                Sign &amp; submit button serializes each unsigned tx, signs
+                via Privy&apos;s embedded Solana wallet, and POSTs the signed
+                payload — same path CC&apos;s web checkout takes after
+                signing.
+              </p>
+            )}
           </>
         )}
       </Section>
