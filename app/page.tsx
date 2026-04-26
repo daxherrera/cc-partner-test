@@ -5,6 +5,8 @@ import { useCallback, useState } from 'react';
 import { CcAsset, fetchCcAssets } from './helius';
 
 const heliusApiKey = process.env.NEXT_PUBLIC_HELIUS_API_KEY ?? '';
+const solanaNetwork: 'mainnet' | 'devnet' =
+  process.env.NEXT_PUBLIC_SOLANA_NETWORK === 'mainnet' ? 'mainnet' : 'devnet';
 
 const apiUrl = (
   process.env.NEXT_PUBLIC_CC_API_URL ?? 'https://dev-api.collectorcrypt.com'
@@ -144,7 +146,7 @@ export default function Page() {
     setAssetsLoading(true);
     setAssetsError(null);
     try {
-      const found = await fetchCcAssets(heliusApiKey, wallet);
+      const found = await fetchCcAssets(heliusApiKey, solanaNetwork, wallet);
       setAssets(found);
       setSelectedAssetIds(new Set());
     } catch (err) {

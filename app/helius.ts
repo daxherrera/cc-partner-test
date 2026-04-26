@@ -33,13 +33,21 @@ interface DasSearchResponse {
   error?: { message?: string };
 }
 
+type Network = 'mainnet' | 'devnet';
+
+const heliusHost = (network: Network): string =>
+  network === 'devnet'
+    ? 'https://devnet.helius-rpc.com'
+    : 'https://mainnet.helius-rpc.com';
+
 async function searchAssets(
   apiKey: string,
+  network: Network,
   ownerAddress: string,
   collectionAddress: string,
 ): Promise<DasSearchResponse> {
   const res = await fetch(
-    `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(apiKey)}`,
+    `${heliusHost(network)}/?api-key=${encodeURIComponent(apiKey)}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -72,11 +80,12 @@ function pickImage(item: DasAssetItem): string | undefined {
 
 export async function fetchCcAssets(
   apiKey: string,
+  network: Network,
   ownerAddress: string,
 ): Promise<CcAsset[]> {
   const [metaplex, core] = await Promise.all([
-    searchAssets(apiKey, ownerAddress, CC_COLLECTIONS.metaplex),
-    searchAssets(apiKey, ownerAddress, CC_COLLECTIONS.core),
+    searchAssets(apiKey, network, ownerAddress, CC_COLLECTIONS.metaplex),
+    searchAssets(apiKey, network, ownerAddress, CC_COLLECTIONS.core),
   ]);
 
   const out: CcAsset[] = [];
