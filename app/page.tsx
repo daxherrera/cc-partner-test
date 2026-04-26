@@ -376,11 +376,17 @@ export default function Page() {
                     {
                       method: 'POST',
                       body: JSON.stringify({
+                        // CC's frontend uses full ISO3166 country/state names
+                        // (not 2-char codes). Match that here so addresses
+                        // created via the partner flow render correctly in
+                        // CC's existing checkout, ShipStation pipeline, and
+                        // admin views.
                         fullName: 'Partner Test User',
-                        country: 'US',
+                        country: 'United States of America',
                         streetAddress: '123 Example St',
+                        apartment: '',
                         city: 'San Francisco',
-                        state: 'CA',
+                        state: 'California',
                         zip: '94103',
                         phoneNumber: '+15555550100',
                         isDefault: false,
