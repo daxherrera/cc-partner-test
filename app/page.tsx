@@ -267,6 +267,24 @@ export default function Page() {
     }
   }, [callCC, nftAddressesInput, shippingAddressId]);
 
+  // /redeem/estimate is the cost-only preview — same totals math as
+  // /redeem/prepare, but no shipment row is created and no Coinflow
+  // session is minted. Safe to call on every input change to keep a
+  // running fee breakdown visible to the user before they commit.
+  const estimateRedemption = useCallback(async () => {
+    const nftAddresses = nftAddressesInput
+      .split(/[\s,]+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    await callCC('POST /redeem/estimate', '/redeem/estimate', {
+      method: 'POST',
+      body: JSON.stringify({
+        nftAddresses,
+        shippingAddressId,
+      }),
+    });
+  }, [callCC, nftAddressesInput, shippingAddressId]);
+
   const signAndSubmitRedemption = useCallback(async () => {
     if (!preparedRedemption) return;
     const { outboundShipmentId, transactions, evmTransactions } =
@@ -618,13 +636,18 @@ export default function Page() {
         {ccUser && (
           <>
             <p style={{ color: '#9ca3af', marginTop: 0 }}>
-              Calls{' '}
-              <code>POST /redeem/prepare</code> — the one-shot composite that
-              creates an outbound shipment in <code>Created</code> status and
-              returns unsigned burn transactions for you to sign. The user&apos;s
-              wallet must own each NFT and hold enough USDC to cover{' '}
-              <code>totalCost</code>; the burn transactions atomically transfer
-              shipping payment alongside the burn.
+              Two endpoints back this flow:{' '}
+              <code>POST /redeem/estimate</code> is a pure-read cost preview
+              (validates ownership + redeemable status, returns the
+              shipping/fees breakdown, no shipment created) — call it as
+              often as you want to keep a live cost UI for the user. Then{' '}
+              <code>POST /redeem/prepare</code> is the one-shot composite
+              that creates the <code>outboundShipment</code> in{' '}
+              <code>Created</code> status and returns unsigned burn
+              transactions for you to sign. The user&apos;s wallet must own
+              each NFT and hold enough USDC to cover{' '}
+              <code>totalCost</code>; the burn transactions atomically
+              transfer shipping payment alongside the burn.
             </p>
             <div
               style={{
@@ -818,6 +841,9 @@ export default function Page() {
               />
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
+              <Button onClick={estimateRedemption} variant='secondary'>
+                Estimate cost
+              </Button>
               <Button onClick={prepareRedemption}>Prepare redemption</Button>
               {preparedRedemption && (
                 <Button
