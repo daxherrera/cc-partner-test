@@ -5,7 +5,6 @@ import { useSignTransaction, useWallets } from '@privy-io/react-auth/solana';
 import { useCallback, useEffect, useState } from 'react';
 import { CcAsset, fetchCcAssets } from './helius';
 
-const heliusApiKey = process.env.NEXT_PUBLIC_HELIUS_API_KEY ?? '';
 const solanaNetwork: 'mainnet' | 'devnet' =
   process.env.NEXT_PUBLIC_SOLANA_NETWORK === 'mainnet' ? 'mainnet' : 'devnet';
 // Mainnet USDC by default; override for devnet test mints if your dev
@@ -14,15 +13,8 @@ const usdcMint =
   process.env.NEXT_PUBLIC_USDC_MINT ??
   'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
-const heliusRpcUrl = (): string =>
-  `https://${solanaNetwork}.helius-rpc.com/?api-key=${encodeURIComponent(
-    heliusApiKey,
-  )}`;
-
 async function fetchUsdcBalance(wallet: string): Promise<number> {
-  if (!heliusApiKey)
-    throw new Error('NEXT_PUBLIC_HELIUS_API_KEY is not set');
-  const res = await fetch(heliusRpcUrl(), {
+  const res = await fetch('/api/helius', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -190,12 +182,6 @@ export default function Page() {
   }, [identityToken]);
 
   const loadAssets = useCallback(async () => {
-    if (!heliusApiKey) {
-      setAssetsError(
-        'NEXT_PUBLIC_HELIUS_API_KEY is not set. Add a Helius key to .env.local to enable wallet lookup.',
-      );
-      return;
-    }
     const wallet = (
       user?.linkedAccounts?.find(
         (a: any) => a.type === 'wallet' && a.chainType === 'solana',
@@ -208,7 +194,7 @@ export default function Page() {
     setAssetsLoading(true);
     setAssetsError(null);
     try {
-      const found = await fetchCcAssets(heliusApiKey, solanaNetwork, wallet);
+      const found = await fetchCcAssets(wallet);
       setAssets(found);
       setSelectedAssetIds(new Set());
     } catch (err) {

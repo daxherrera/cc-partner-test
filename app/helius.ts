@@ -33,37 +33,25 @@ interface DasSearchResponse {
   error?: { message?: string };
 }
 
-type Network = 'mainnet' | 'devnet';
-
-const heliusHost = (network: Network): string =>
-  network === 'devnet'
-    ? 'https://devnet.helius-rpc.com'
-    : 'https://mainnet.helius-rpc.com';
-
 async function searchAssets(
-  apiKey: string,
-  network: Network,
   ownerAddress: string,
   collectionAddress: string,
 ): Promise<DasSearchResponse> {
-  const res = await fetch(
-    `${heliusHost(network)}/?api-key=${encodeURIComponent(apiKey)}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 'cc-partner-test',
-        method: 'searchAssets',
-        params: {
-          ownerAddress,
-          grouping: ['collection', collectionAddress],
-          limit: 1000,
-          page: 1,
-        },
-      }),
-    },
-  );
+  const res = await fetch('/api/helius', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 'cc-partner-test',
+      method: 'searchAssets',
+      params: {
+        ownerAddress,
+        grouping: ['collection', collectionAddress],
+        limit: 1000,
+        page: 1,
+      },
+    }),
+  });
   if (!res.ok) {
     throw new Error(`Helius ${res.status}: ${await res.text()}`);
   }
@@ -79,13 +67,11 @@ function pickImage(item: DasAssetItem): string | undefined {
 }
 
 export async function fetchCcAssets(
-  apiKey: string,
-  network: Network,
   ownerAddress: string,
 ): Promise<CcAsset[]> {
   const [metaplex, core] = await Promise.all([
-    searchAssets(apiKey, network, ownerAddress, CC_COLLECTIONS.metaplex),
-    searchAssets(apiKey, network, ownerAddress, CC_COLLECTIONS.core),
+    searchAssets(ownerAddress, CC_COLLECTIONS.metaplex),
+    searchAssets(ownerAddress, CC_COLLECTIONS.core),
   ]);
 
   const out: CcAsset[] = [];
