@@ -1,42 +1,47 @@
 'use client';
 
-import { useIdentityToken, usePrivy } from '@privy-io/react-auth';
-import { useSignTransaction, useWallets } from '@privy-io/react-auth/solana';
+import { Transaction, VersionedTransaction } from '@solana/web3.js';
+import bs58 from 'bs58';
 import { useCallback, useEffect, useState } from 'react';
-import { CcAsset, fetchCcAssets } from './helius';
+import { CcAsset, fetchCcAssets } from '../helius';
+
+const apiUrl = (
+  process.env.NEXT_PUBLIC_CC_API_URL || 'https://dev-api.collectorcrypt.com'
+).replace(/\/+$/, '');
+
+const defaultPartnerSlug =
+  process.env.NEXT_PUBLIC_CC_SIWS_PARTNER_SLUG || 'cc-partner-test';
 
 const solanaNetwork: 'mainnet' | 'devnet' =
   process.env.NEXT_PUBLIC_SOLANA_NETWORK === 'mainnet' ? 'mainnet' : 'devnet';
-// Mainnet USDC by default; override for devnet test mints if your dev
-// environment doesn't use mainnet USDC.
 const usdcMint =
   process.env.NEXT_PUBLIC_USDC_MINT ??
   'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
-async function fetchUsdcBalance(wallet: string): Promise<number> {
-  const res = await fetch('/api/helius', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 'cc-usdc-balance',
-      method: 'getTokenAccountsByOwner',
-      params: [
-        wallet,
-        { mint: usdcMint },
-        { encoding: 'jsonParsed' },
-      ],
-    }),
-  });
-  if (!res.ok) throw new Error(`Helius ${res.status}: ${await res.text()}`);
-  const json = await res.json();
-  const accounts = json?.result?.value ?? [];
-  let total = 0;
-  for (const acc of accounts) {
-    const ui = acc?.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
-    if (typeof ui === 'number') total += ui;
-  }
-  return total;
+interface PhantomProvider {
+  isPhantom?: boolean;
+  publicKey: { toString(): string } | null;
+  connect: (opts?: { onlyIfTrusted?: boolean }) => Promise<{
+    publicKey: { toString(): string };
+  }>;
+  disconnect: () => Promise<void>;
+  signMessage: (
+    message: Uint8Array,
+    encoding?: 'utf8',
+  ) => Promise<{ signature: Uint8Array }>;
+  signTransaction: <T extends Transaction | VersionedTransaction>(
+    transaction: T,
+  ) => Promise<T>;
+}
+
+function getPhantom(): PhantomProvider | null {
+  if (typeof window === 'undefined') return null;
+  const anyWindow = window as unknown as {
+    phantom?: { solana?: PhantomProvider };
+    solana?: PhantomProvider;
+  };
+  const p = anyWindow.phantom?.solana ?? anyWindow.solana;
+  return p && p.isPhantom ? p : (p ?? null);
 }
 
 function base64ToBytes(b64: string): Uint8Array {
@@ -45,35 +50,46 @@ function base64ToBytes(b64: string): Uint8Array {
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
 }
+
 function bytesToBase64(bytes: Uint8Array): string {
   let s = '';
   for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
   return btoa(s);
 }
 
-const apiUrl = (
-  process.env.NEXT_PUBLIC_CC_API_URL || 'https://dev-api.collectorcrypt.com'
-).replace(/\/+$/, '');
+/** Backend returns base64-encoded serialized transactions. Phantom signs
+ * Transaction or VersionedTransaction objects, so we have to deserialize.
+ * Try VersionedTransaction first (newer message format); fall back to
+ * legacy Transaction. */
+function deserializeUnsignedTx(
+  b64: string,
+): Transaction | VersionedTransaction {
+  const bytes = base64ToBytes(b64);
+  try {
+    return VersionedTransaction.deserialize(bytes);
+  } catch {
+    return Transaction.from(bytes);
+  }
+}
 
-type CCUser = {
-  id?: string;
-  wallet?: string;
-  email?: string;
-  role?: string;
-  [key: string]: unknown;
-};
+function serializeSignedTx(
+  tx: Transaction | VersionedTransaction,
+): Uint8Array {
+  // Legacy Transaction.serialize() defaults to `requireAllSignatures: true`
+  // which throws when a partner / fee-payer hasn't co-signed yet. Bypass
+  // that check — Phantom's user signature is all this leg of the flow has.
+  if ('version' in tx) return tx.serialize();
+  return tx.serialize({ requireAllSignatures: false, verifySignatures: false });
+}
 
-type CallResult =
-  | { status: 'idle' }
-  | { status: 'pending'; label: string }
-  | {
-      status: 'done';
-      label: string;
-      httpStatus: number;
-      ok: boolean;
-      body: unknown;
-    }
-  | { status: 'error'; label: string; message: string };
+async function parseBody(res: Response): Promise<unknown> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
 
 function decodeJwtClaims(token: string): Record<string, unknown> | null {
   try {
@@ -87,27 +103,74 @@ function decodeJwtClaims(token: string): Record<string, unknown> | null {
   }
 }
 
-async function parseBody(res: Response): Promise<unknown> {
-  const text = await res.text();
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
+async function fetchUsdcBalance(wallet: string): Promise<number> {
+  const res = await fetch('/api/helius', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 'cc-usdc-balance',
+      method: 'getTokenAccountsByOwner',
+      params: [wallet, { mint: usdcMint }, { encoding: 'jsonParsed' }],
+    }),
+  });
+  if (!res.ok) throw new Error(`Helius ${res.status}: ${await res.text()}`);
+  const json = await res.json();
+  const accounts = json?.result?.value ?? [];
+  let total = 0;
+  for (const acc of accounts) {
+    const ui = acc?.account?.data?.parsed?.info?.tokenAmount?.uiAmount;
+    if (typeof ui === 'number') total += ui;
   }
+  return total;
 }
 
-export default function Page() {
-  const { ready, authenticated, user, login, logout } = usePrivy();
-  const { identityToken } = useIdentityToken();
-  const { wallets: solanaWallets } = useWallets();
-  const { signTransaction } = useSignTransaction();
+type CallResult =
+  | { status: 'idle' }
+  | { status: 'pending'; label: string }
+  | {
+      status: 'done';
+      label: string;
+      httpStatus: number;
+      ok: boolean;
+      body: unknown;
+    }
+  | { status: 'error'; label: string; message: string };
 
-  const [ccUser, setCcUser] = useState<CCUser | null>(null);
-  const [connectError, setConnectError] = useState<string | null>(null);
+interface NonceResponse {
+  nonce: string;
+  expiresAt: number;
+  message: string;
+}
+
+interface TokenPair {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+}
+
+interface PreparedRedemption {
+  outboundShipmentId: string;
+  transactions?: string[];
+  evmTransactions?: unknown[];
+  totalCost?: string;
+}
+
+export default function SiwsPage() {
+  const [wallet, setWallet] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
+  const [partnerSlug, setPartnerSlug] = useState(defaultPartnerSlug);
+  const [domain, setDomain] = useState('');
+  const [uri, setUri] = useState('');
+  const [nonceData, setNonceData] = useState<NonceResponse | null>(null);
+  const [tokens, setTokens] = useState<TokenPair | null>(null);
+  const [siwsErr, setSiwsErr] = useState<string | null>(null);
   const [result, setResult] = useState<CallResult>({ status: 'idle' });
-  const [nftAddressesInput, setNftAddressesInput] = useState('');
   const [shippingAddressId, setShippingAddressId] = useState('');
+  const [nftAddressesInput, setNftAddressesInput] = useState('');
+  const [providerDetected, setProviderDetected] = useState<boolean | null>(
+    null,
+  );
   const [assets, setAssets] = useState<CcAsset[] | null>(null);
   const [assetsLoading, setAssetsLoading] = useState(false);
   const [assetsError, setAssetsError] = useState<string | null>(null);
@@ -116,26 +179,169 @@ export default function Page() {
   );
   const [usdcBalance, setUsdcBalance] = useState<number | null>(null);
   const [usdcError, setUsdcError] = useState<string | null>(null);
-  const [preparedRedemption, setPreparedRedemption] = useState<{
-    outboundShipmentId: string;
-    transactions?: string[];
-    evmTransactions?: unknown[];
-    totalCost?: string;
-  } | null>(null);
+  const [preparedRedemption, setPreparedRedemption] =
+    useState<PreparedRedemption | null>(null);
   const [signingSubmit, setSigningSubmit] = useState(false);
+
+  useEffect(() => {
+    if (!domain && typeof window !== 'undefined')
+      setDomain(window.location.hostname);
+    if (!uri && typeof window !== 'undefined')
+      setUri(`${window.location.protocol}//${window.location.host}`);
+    setProviderDetected(getPhantom() !== null);
+  }, [domain, uri]);
+
+  const connectPhantom = useCallback(async () => {
+    setConnecting(true);
+    setSiwsErr(null);
+    try {
+      const p = getPhantom();
+      if (!p) {
+        setSiwsErr(
+          'No Solana wallet detected. Install Phantom (or any window.solana provider) and reload.',
+        );
+        return;
+      }
+      const { publicKey } = await p.connect();
+      setWallet(publicKey.toString());
+    } catch (err) {
+      setSiwsErr(err instanceof Error ? err.message : String(err));
+    } finally {
+      setConnecting(false);
+    }
+  }, []);
+
+  const disconnect = useCallback(async () => {
+    const p = getPhantom();
+    if (p) await p.disconnect();
+    setWallet(null);
+    setNonceData(null);
+    setTokens(null);
+    setSiwsErr(null);
+    setResult({ status: 'idle' });
+    setAssets(null);
+    setSelectedAssetIds(new Set());
+    setUsdcBalance(null);
+    setPreparedRedemption(null);
+  }, []);
+
+  const mintNonce = useCallback(async () => {
+    setSiwsErr(null);
+    setNonceData(null);
+    if (!wallet) {
+      setSiwsErr('Connect a wallet first.');
+      return;
+    }
+    try {
+      const res = await fetch(`${apiUrl}/auth/wallet/nonce`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          wallet,
+          partnerAppId: partnerSlug,
+          domain,
+          uri,
+        }),
+      });
+      const body = await parseBody(res);
+      if (!res.ok) {
+        setSiwsErr(
+          `Nonce mint failed (${res.status}): ${
+            typeof body === 'string' ? body : JSON.stringify(body)
+          }`,
+        );
+        return;
+      }
+      setNonceData(body as NonceResponse);
+    } catch (err) {
+      setSiwsErr(err instanceof Error ? err.message : String(err));
+    }
+  }, [wallet, partnerSlug, domain, uri]);
+
+  const signAndVerify = useCallback(async () => {
+    setSiwsErr(null);
+    if (!nonceData) {
+      setSiwsErr('Mint a nonce first.');
+      return;
+    }
+    const p = getPhantom();
+    if (!p) {
+      setSiwsErr('No wallet provider available.');
+      return;
+    }
+    try {
+      const messageBytes = new TextEncoder().encode(nonceData.message);
+      const { signature } = await p.signMessage(messageBytes, 'utf8');
+      const signatureB58 = bs58.encode(signature);
+      const res = await fetch(`${apiUrl}/auth/wallet/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: nonceData.message,
+          signature: signatureB58,
+        }),
+      });
+      const body = await parseBody(res);
+      if (!res.ok) {
+        setSiwsErr(
+          `Verify failed (${res.status}): ${
+            typeof body === 'string' ? body : JSON.stringify(body)
+          }`,
+        );
+        return;
+      }
+      setTokens(body as TokenPair);
+      setNonceData(null);
+    } catch (err) {
+      setSiwsErr(err instanceof Error ? err.message : String(err));
+    }
+  }, [nonceData]);
+
+  const refreshSession = useCallback(async () => {
+    if (!tokens) return;
+    try {
+      const res = await fetch(`${apiUrl}/auth/wallet/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refreshToken: tokens.refreshToken }),
+      });
+      const body = await parseBody(res);
+      if (!res.ok) {
+        setSiwsErr(
+          `Refresh failed (${res.status}): ${
+            typeof body === 'string' ? body : JSON.stringify(body)
+          }`,
+        );
+        return;
+      }
+      setTokens(body as TokenPair);
+    } catch (err) {
+      setSiwsErr(err instanceof Error ? err.message : String(err));
+    }
+  }, [tokens]);
+
+  const logoutSession = useCallback(async () => {
+    if (!tokens) return;
+    await fetch(`${apiUrl}/auth/wallet/logout`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken: tokens.refreshToken }),
+    });
+    setTokens(null);
+    setPreparedRedemption(null);
+  }, [tokens]);
 
   const callCC = useCallback(
     async (label: string, path: string, init?: RequestInit) => {
       setResult({ status: 'pending', label });
       try {
-        if (!identityToken)
-          throw new Error('No Privy identity token yet — log in first');
+        if (!tokens) throw new Error('No SIWS access token yet — sign in first');
         const res = await fetch(`${apiUrl}${path}`, {
           ...init,
           headers: {
             'Content-Type': 'application/json',
             ...(init?.headers ?? {}),
-            Authorization: `Bearer ${identityToken}`,
+            Authorization: `Bearer ${tokens.accessToken}`,
           },
         });
         const body = await parseBody(res);
@@ -153,43 +359,12 @@ export default function Page() {
         return null;
       }
     },
-    [identityToken],
+    [tokens],
   );
 
-  const connect = useCallback(async () => {
-    setConnecting(true);
-    setConnectError(null);
-    try {
-      if (!identityToken) {
-        setConnectError('No Privy identity token yet — log in first');
-        return;
-      }
-      const res = await fetch(`${apiUrl}/users/info`, {
-        headers: { Authorization: `Bearer ${identityToken}` },
-      });
-      const body = await parseBody(res);
-      if (!res.ok) {
-        setConnectError(
-          `CollectorCrypt rejected the token (${res.status}): ${
-            typeof body === 'string' ? body : JSON.stringify(body)
-          }`,
-        );
-        return;
-      }
-      setCcUser(body as CCUser);
-    } finally {
-      setConnecting(false);
-    }
-  }, [identityToken]);
-
   const loadAssets = useCallback(async () => {
-    const wallet = (
-      user?.linkedAccounts?.find(
-        (a: any) => a.type === 'wallet' && a.chainType === 'solana',
-      ) as { address?: string } | undefined
-    )?.address;
     if (!wallet) {
-      setAssetsError('No Solana wallet on this Privy session.');
+      setAssetsError('Connect a wallet first.');
       return;
     }
     setAssetsLoading(true);
@@ -203,7 +378,7 @@ export default function Page() {
     } finally {
       setAssetsLoading(false);
     }
-  }, [user]);
+  }, [wallet]);
 
   const toggleAssetSelected = useCallback((id: string) => {
     setSelectedAssetIds(prev => {
@@ -219,11 +394,6 @@ export default function Page() {
   }, [selectedAssetIds]);
 
   const loadUsdcBalance = useCallback(async () => {
-    const wallet = (
-      user?.linkedAccounts?.find(
-        (a: any) => a.type === 'wallet' && a.chainType === 'solana',
-      ) as { address?: string } | undefined
-    )?.address;
     if (!wallet) return;
     setUsdcError(null);
     try {
@@ -233,7 +403,18 @@ export default function Page() {
       setUsdcError(err instanceof Error ? err.message : String(err));
       setUsdcBalance(null);
     }
-  }, [user]);
+  }, [wallet]);
+
+  const estimateRedemption = useCallback(async () => {
+    const nftAddresses = nftAddressesInput
+      .split(/[\s,]+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    await callCC('POST /redeem/estimate', '/redeem/estimate', {
+      method: 'POST',
+      body: JSON.stringify({ nftAddresses, shippingAddressId }),
+    });
+  }, [callCC, nftAddressesInput, shippingAddressId]);
 
   const prepareRedemption = useCallback(async () => {
     setPreparedRedemption(null);
@@ -246,30 +427,13 @@ export default function Page() {
       body: JSON.stringify({
         nftAddresses,
         shippingAddressId,
+        paymentMethod: 'crypto',
         coin: 'USDC',
       }),
     });
     if (res?.ok && typeof res.body === 'object' && res.body) {
-      setPreparedRedemption(res.body as never);
+      setPreparedRedemption(res.body as PreparedRedemption);
     }
-  }, [callCC, nftAddressesInput, shippingAddressId]);
-
-  // /redeem/estimate is the cost-only preview — same totals math as
-  // /redeem/prepare, but no shipment row is created and no Coinflow
-  // session is minted. Safe to call on every input change to keep a
-  // running fee breakdown visible to the user before they commit.
-  const estimateRedemption = useCallback(async () => {
-    const nftAddresses = nftAddressesInput
-      .split(/[\s,]+/)
-      .map(s => s.trim())
-      .filter(Boolean);
-    await callCC('POST /redeem/estimate', '/redeem/estimate', {
-      method: 'POST',
-      body: JSON.stringify({
-        nftAddresses,
-        shippingAddressId,
-      }),
-    });
   }, [callCC, nftAddressesInput, shippingAddressId]);
 
   const signAndSubmitRedemption = useCallback(async () => {
@@ -281,7 +445,7 @@ export default function Page() {
         status: 'error',
         label: 'sign-and-submit',
         message:
-          'EVM transactions detected — this demo only signs Solana. Use the Privy EVM signing hooks to handle the evmTransactions array.',
+          'EVM transactions detected — this SIWS demo only signs Solana. Add an EVM signer for the evmTransactions array if your partner supports it.',
       });
       return;
     }
@@ -293,13 +457,12 @@ export default function Page() {
       });
       return;
     }
-    const wallet = solanaWallets?.[0];
-    if (!wallet) {
+    const p = getPhantom();
+    if (!p) {
       setResult({
         status: 'error',
         label: 'sign-and-submit',
-        message:
-          'No connected Solana wallet on this Privy session. Log out and back in via the embedded wallet flow.',
+        message: 'No wallet provider available.',
       });
       return;
     }
@@ -311,11 +474,9 @@ export default function Page() {
     try {
       const signedB64: string[] = [];
       for (const tx of transactions) {
-        const { signedTransaction } = await signTransaction({
-          transaction: base64ToBytes(tx),
-          wallet,
-        });
-        signedB64.push(bytesToBase64(signedTransaction));
+        const unsigned = deserializeUnsignedTx(tx);
+        const signed = await p.signTransaction(unsigned);
+        signedB64.push(bytesToBase64(serializeSignedTx(signed)));
       }
       const submitRes = await fetch(
         `${apiUrl}/blockchain/${outboundShipmentId}/burn`,
@@ -323,7 +484,7 @@ export default function Page() {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${identityToken}`,
+            Authorization: `Bearer ${tokens!.accessToken}`,
           },
           body: JSON.stringify({ transactions: signedB64 }),
         },
@@ -346,98 +507,49 @@ export default function Page() {
     } finally {
       setSigningSubmit(false);
     }
-  }, [
-    identityToken,
-    preparedRedemption,
-    signTransaction,
-    solanaWallets,
-  ]);
+  }, [preparedRedemption, tokens]);
 
-  const deleteShippingAddress = useCallback(() => {
-    if (!shippingAddressId.trim()) return;
-    callCC(
-      `DELETE /shipping-address/${shippingAddressId}`,
-      `/shipping-address/${encodeURIComponent(shippingAddressId.trim())}`,
-      { method: 'DELETE' },
-    );
-  }, [callCC, shippingAddressId]);
-
-  const reset = useCallback(() => {
-    setCcUser(null);
-    setConnectError(null);
-    setResult({ status: 'idle' });
-  }, []);
-
-  const handleLogout = useCallback(async () => {
-    reset();
-    await logout();
-  }, [logout, reset]);
-
-  // Auto-fetch USDC balance once we know who the user is.
+  // Auto-fetch USDC balance once authenticated.
   useEffect(() => {
-    if (ccUser) loadUsdcBalance();
-  }, [ccUser, loadUsdcBalance]);
+    if (tokens && wallet) loadUsdcBalance();
+  }, [tokens, wallet, loadUsdcBalance]);
 
-  if (!ready) return <Shell>Booting Privy…</Shell>;
-
-  if (!authenticated)
-    return (
-      <Shell>
-        <h1 style={{ marginTop: 0 }}>CC Partner Test</h1>
-        <p style={{ color: '#9ca3af' }}>
-          Reference integration showing how a partner app authenticates its
-          users to CollectorCrypt&apos;s API. Authenticate with your own Privy
-          app, then send the resulting Privy <strong>identity token</strong>{' '}
-          as a Bearer header to CollectorCrypt.
-        </p>
-        <p style={{ color: '#9ca3af' }}>
-          Target backend: <code>{apiUrl}</code>
-        </p>
-        <p style={{ color: '#9ca3af' }}>
-          <a href='/siws' style={{ color: '#a5f3fc' }}>
-            → Native SIWS flow (Phantom-style window.solana, no Privy)
-          </a>
-        </p>
-        <Button onClick={login}>Log in with Partner Privy</Button>
-      </Shell>
-    );
-
-  const solanaWallet = user?.linkedAccounts?.find(
-    (a: any) => a.type === 'wallet' && a.chainType === 'solana',
-  ) as { address?: string } | undefined;
-
-  const userEmail =
-    (user?.email as any)?.address ??
-    (user?.linkedAccounts?.find(
-      (a: any) => typeof (a as any).email === 'string',
-    ) as any)?.email ??
-    '—';
-
-  const decodedIdentity = identityToken ? decodeJwtClaims(identityToken) : null;
+  const decodedAccess = tokens ? decodeJwtClaims(tokens.accessToken) : null;
 
   return (
     <Shell>
-      <h1 style={{ marginTop: 0 }}>CC Partner Test</h1>
+      <h1 style={{ marginTop: 0 }}>CC Partner Test — Native SIWS</h1>
+      <p style={{ color: '#9ca3af' }}>
+        Sign-in-with-Solana reference for the wallet-vendor integration path.
+        No Privy on this page — this is the bare flow Phantom (or any{' '}
+        <code>window.solana</code> provider) will use from inside the wallet
+        UI. Connects via <code>window.solana</code>, calls{' '}
+        <code>POST /auth/wallet/nonce</code> → signs the returned message →{' '}
+        <code>POST /auth/wallet/verify</code> for a CC-issued JWT. The
+        resulting access token is scoped to the routes the backend annotates
+        with <code>@WalletAuthAllowed()</code>.
+      </p>
       <p style={{ color: '#9ca3af' }}>
         Target backend: <code>{apiUrl}</code>
       </p>
       <p style={{ color: '#9ca3af' }}>
-        <a href='/siws' style={{ color: '#a5f3fc' }}>
-          → Native SIWS flow (Phantom-style window.solana, no Privy)
+        <a href='/' style={{ color: '#a5f3fc' }}>
+          ← back to Track A (Privy identity tokens)
         </a>
       </p>
 
-      <Section
-        title='1. Partner Privy session'
-        right={
-          <Button onClick={handleLogout} variant='secondary'>
-            Log out
-          </Button>
-        }
-      >
-        <Row label='DID' value={user?.id ?? '—'} />
-        <Row label='Email' value={userEmail} />
-        <Row label='Solana wallet' value={solanaWallet?.address ?? '—'} />
+      <Section title='1. Wallet'>
+        <Row
+          label='Provider'
+          value={
+            providerDetected === null
+              ? '…'
+              : providerDetected
+                ? 'detected'
+                : 'window.solana not found'
+          }
+        />
+        <Row label='Connected wallet' value={wallet ?? '—'} />
         <Row
           label={`USDC balance (${solanaNetwork})`}
           value={
@@ -448,94 +560,129 @@ export default function Page() {
                 : `${usdcBalance.toFixed(6)} USDC`
           }
         />
+        <div style={{ display: 'flex', gap: 12, marginTop: 12 }}>
+          {!wallet && (
+            <Button onClick={connectPhantom}>
+              {connecting ? 'Connecting…' : 'Connect wallet'}
+            </Button>
+          )}
+          {wallet && (
+            <Button variant='secondary' onClick={disconnect}>
+              Disconnect
+            </Button>
+          )}
+        </div>
       </Section>
 
-      <Section title='2. Identity token (the Bearer we send)'>
-        <p style={{ color: '#9ca3af', marginTop: 0 }}>
-          Privy issues an identity token alongside the access token. It carries
-          the user&apos;s linked accounts (wallets, email) as claims, signed by
-          your partner app&apos;s key. CollectorCrypt&apos;s backend verifies
-          it against your app&apos;s public JWKS at{' '}
-          <code>https://auth.privy.io/api/v1/apps/{`{partnerAppId}`}/jwks.json</code>{' '}
-          and reads the wallet from the claims — no app secret exchanged.
-        </p>
-        <Row
-          label='Present?'
-          value={identityToken ? `yes (len ${identityToken.length})` : 'no'}
+      <Section title='2. SIWS exchange'>
+        <Field
+          label='Partner slug or privyAppId'
+          value={partnerSlug}
+          onChange={setPartnerSlug}
         />
-        {decodedIdentity && (
-          <details style={{ marginTop: 12 }} open>
-            <summary style={{ color: '#9ca3af', cursor: 'pointer' }}>
-              Decoded identity token claims
-            </summary>
-            <pre style={preStyle}>
-              {JSON.stringify(decodedIdentity, null, 2)}
-            </pre>
-            {identityToken && (
-              <button
-                onClick={() => navigator.clipboard.writeText(identityToken)}
-                style={{
-                  background: '#27272e',
-                  border: 'none',
-                  borderRadius: 6,
-                  color: 'white',
-                  cursor: 'pointer',
-                  fontSize: 13,
-                  marginTop: 8,
-                  padding: '6px 12px',
-                }}
-              >
-                Copy raw identity token
-              </button>
-            )}
-          </details>
+        <Field
+          label='Domain (must be in allowedSiwsDomains)'
+          value={domain}
+          onChange={setDomain}
+        />
+        <Field
+          label='URI (shown in the SIWS message)'
+          value={uri}
+          onChange={setUri}
+        />
+        <div
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: 12,
+            marginTop: 12,
+          }}
+        >
+          <Button onClick={mintNonce}>1. Mint nonce</Button>
+          <Button onClick={signAndVerify}>2. Sign &amp; verify</Button>
+        </div>
+        {siwsErr && (
+          <div
+            style={{
+              color: '#f87171',
+              marginTop: 12,
+              whiteSpace: 'pre-wrap',
+            }}
+          >
+            {siwsErr}
+          </div>
+        )}
+        {nonceData && (
+          <div style={{ marginTop: 16 }}>
+            <Row label='Nonce' value={nonceData.nonce} />
+            <Row
+              label='Expires at'
+              value={new Date(nonceData.expiresAt).toISOString()}
+            />
+            <details style={{ marginTop: 8 }} open>
+              <summary style={{ color: '#9ca3af', cursor: 'pointer' }}>
+                Canonical SIWS message (this is exactly what your user signs)
+              </summary>
+              <pre style={preStyle}>{nonceData.message}</pre>
+            </details>
+          </div>
         )}
       </Section>
 
-      <Section title='3. Connect to CollectorCrypt'>
-        {!ccUser && !connectError && (
-          <>
-            <p style={{ color: '#9ca3af', marginTop: 0 }}>
-              Sends the identity token as <code>Authorization: Bearer</code> to{' '}
-              <code>GET /users/info</code>. On 200, CC has registered (or
-              found) your user keyed on the wallet from the token.
-            </p>
-            <Button onClick={connect}>
-              {connecting ? 'Connecting…' : 'Connect'}
-            </Button>
-          </>
-        )}
-        {connectError && (
-          <>
-            <div style={{ color: '#f87171', marginBottom: 12 }}>
-              {connectError}
+      <Section
+        title='3. Session'
+        right={
+          tokens && (
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Button variant='secondary' onClick={refreshSession}>
+                Refresh
+              </Button>
+              <Button variant='secondary' onClick={logoutSession}>
+                Logout
+              </Button>
             </div>
-            <Button onClick={connect}>
-              {connecting ? 'Retrying…' : 'Retry'}
-            </Button>
-          </>
-        )}
-        {ccUser && (
+          )
+        }
+      >
+        {!tokens && <div style={{ color: '#6b7280' }}>No session yet.</div>}
+        {tokens && (
           <>
-            <Row label='CC user id' value={ccUser.id ?? '—'} />
-            <Row label='Role' value={ccUser.role ?? '—'} />
-            <Row label='Wallet' value={ccUser.wallet ?? '—'} />
-            <Row label='Email' value={ccUser.email ?? '—'} />
+            <Row
+              label='Access expires at'
+              value={new Date(tokens.expiresAt).toISOString()}
+            />
+            <Row
+              label='Refresh token'
+              value={`${tokens.refreshToken.slice(0, 12)}…`}
+            />
+            {decodedAccess && (
+              <details style={{ marginTop: 8 }}>
+                <summary style={{ color: '#9ca3af', cursor: 'pointer' }}>
+                  Decoded access-token claims
+                </summary>
+                <pre style={preStyle}>
+                  {JSON.stringify(decodedAccess, null, 2)}
+                </pre>
+              </details>
+            )}
+            <details style={{ marginTop: 8 }}>
+              <summary style={{ color: '#9ca3af', cursor: 'pointer' }}>
+                Raw access token (copy for curl)
+              </summary>
+              <pre style={preStyle}>{tokens.accessToken}</pre>
+            </details>
           </>
         )}
       </Section>
 
       <Section title='4. User-self API'>
-        {!ccUser && (
-          <div style={{ color: '#6b7280' }}>Connect first.</div>
-        )}
-        {ccUser && (
+        {!tokens && <div style={{ color: '#6b7280' }}>Sign in first.</div>}
+        {tokens && (
           <>
             <p style={{ color: '#9ca3af', marginTop: 0 }}>
-              Endpoints a partner-originated user can call with their identity
-              token. Admin / shipper / vault routes are deliberately blocked
-              for partner users by CC&apos;s backend — partners only see the
-              user-self surface.
+              Endpoints a wallet-auth user can call with their CC-issued
+              token. These are the ones the backend annotates with{' '}
+              <code>@WalletAuthAllowed()</code>.
             </p>
             <div
               style={{
@@ -546,14 +693,11 @@ export default function Page() {
               }}
             >
               <Button
-                onClick={() => callCC('GET /users/info', '/users/info')}
+                onClick={() =>
+                  callCC('GET /auth/wallet/me', '/auth/wallet/me')
+                }
               >
-                My profile
-              </Button>
-              <Button
-                onClick={() => callCC('GET /users/cards', '/users/cards')}
-              >
-                My cards
+                My session
               </Button>
               <Button
                 onClick={() =>
@@ -569,23 +713,6 @@ export default function Page() {
               >
                 My outbound shipments
               </Button>
-            </div>
-            <p style={{ color: '#9ca3af', marginTop: 16 }}>
-              Mutations — these write to the connected user&apos;s account.
-            </p>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
-              <Button
-                onClick={() =>
-                  callCC('PATCH /users/update', '/users/update', {
-                    method: 'PATCH',
-                    body: JSON.stringify({
-                      bio: `partner-test bio @ ${new Date().toISOString()}`,
-                    }),
-                  })
-                }
-              >
-                Update bio
-              </Button>
               <Button
                 onClick={() =>
                   callCC(
@@ -594,12 +721,7 @@ export default function Page() {
                     {
                       method: 'POST',
                       body: JSON.stringify({
-                        // CC's frontend uses full ISO3166 country/state names
-                        // (not 2-char codes). Match that here so addresses
-                        // created via the partner flow render correctly in
-                        // CC's existing checkout, ShipStation pipeline, and
-                        // admin views.
-                        fullName: 'Partner Test User',
+                        fullName: 'SIWS Test User',
                         country: 'United States of America',
                         streetAddress: '123 Example St',
                         apartment: '',
@@ -615,22 +737,14 @@ export default function Page() {
               >
                 Add a shipping address
               </Button>
-              <Button
-                onClick={deleteShippingAddress}
-                variant='secondary'
-              >
-                Delete shipping address (uses ID below)
-              </Button>
             </div>
           </>
         )}
       </Section>
 
       <Section title='5. Redeem cards (composite burn-prepare)'>
-        {!ccUser && (
-          <div style={{ color: '#6b7280' }}>Connect first.</div>
-        )}
-        {ccUser && (
+        {!tokens && <div style={{ color: '#6b7280' }}>Sign in first.</div>}
+        {tokens && (
           <>
             <p style={{ color: '#9ca3af', marginTop: 0 }}>
               Two endpoints back this flow:{' '}
@@ -641,10 +755,10 @@ export default function Page() {
               <code>POST /redeem/prepare</code> is the one-shot composite
               that creates the <code>outboundShipment</code> in{' '}
               <code>Created</code> status and returns unsigned burn
-              transactions for you to sign. The user&apos;s wallet must own
-              each NFT and hold enough USDC to cover{' '}
-              <code>totalCost</code>; the burn transactions atomically
-              transfer shipping payment alongside the burn.
+              transactions for the user to sign. The wallet must own each
+              NFT and hold enough USDC to cover <code>totalCost</code>; the
+              burn transactions atomically transfer shipping payment
+              alongside the burn.
             </p>
             <div
               style={{
@@ -683,7 +797,9 @@ export default function Page() {
                   </Button>
                 )}
               </div>
-              <div style={{ color: '#6b7280', fontSize: 12, marginBottom: 8 }}>
+              <div
+                style={{ color: '#6b7280', fontSize: 12, marginBottom: 8 }}
+              >
                 Filters by CC&apos;s collection groupings (
                 <code>CCryptWBYkt…</code> for Metaplex,{' '}
                 <code>CCryptUfeFSZ…</code> for Core). Includes both standard
@@ -704,7 +820,8 @@ export default function Page() {
                   style={{
                     display: 'grid',
                     gap: 8,
-                    gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
+                    gridTemplateColumns:
+                      'repeat(auto-fill, minmax(220px, 1fr))',
                     maxHeight: 320,
                     overflowY: 'auto',
                   }}
@@ -817,8 +934,8 @@ export default function Page() {
                   marginBottom: 4,
                 }}
               >
-                Shipping address ID (run{' '}
-                <code>GET /shipping-address</code> in section 4 to find one)
+                Shipping address ID (run &quot;My shipping addresses&quot;
+                above to find one)
               </label>
               <input
                 value={shippingAddressId}
@@ -851,9 +968,10 @@ export default function Page() {
                     ? 'Signing & submitting…'
                     : `Sign & submit (${
                         preparedRedemption.transactions?.length ?? 0
-                      } tx → /blockchain/${
-                        preparedRedemption.outboundShipmentId.slice(0, 8)
-                      }…/burn)`}
+                      } tx → /blockchain/${preparedRedemption.outboundShipmentId.slice(
+                        0,
+                        8,
+                      )}…/burn)`}
                 </Button>
               )}
             </div>
@@ -869,10 +987,10 @@ export default function Page() {
                 Prepared shipment{' '}
                 <code>{preparedRedemption.outboundShipmentId}</code> · cost{' '}
                 <code>{preparedRedemption.totalCost ?? '—'} USDC</code>. The
-                Sign &amp; submit button serializes each unsigned tx, signs
-                via Privy&apos;s embedded Solana wallet, and POSTs the signed
-                payload — same path CC&apos;s web checkout takes after
-                signing.
+                Sign &amp; submit button deserializes each unsigned tx, signs
+                via <code>window.solana.signTransaction</code>, and POSTs the
+                signed payload to <code>/blockchain/:id/burn</code> — the
+                same path CC&apos;s web checkout takes after signing.
               </p>
             )}
           </>
@@ -941,7 +1059,7 @@ function Section({
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <div style={{ display: 'flex', fontSize: 14, padding: '4px 0' }}>
-      <div style={{ color: '#9ca3af', minWidth: 140 }}>{label}</div>
+      <div style={{ color: '#9ca3af', minWidth: 180 }}>{label}</div>
       <div
         style={{
           color: '#e5e7eb',
@@ -951,6 +1069,45 @@ function Row({ label, value }: { label: string; value: string }) {
       >
         {value}
       </div>
+    </div>
+  );
+}
+
+function Field({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <label
+        style={{
+          color: '#9ca3af',
+          display: 'block',
+          fontSize: 13,
+          marginBottom: 4,
+        }}
+      >
+        {label}
+      </label>
+      <input
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        style={{
+          background: '#0b0b0f',
+          border: '1px solid #27272e',
+          borderRadius: 6,
+          color: '#e5e7eb',
+          fontFamily: 'ui-monospace, monospace',
+          fontSize: 13,
+          padding: '8px 10px',
+          width: '100%',
+        }}
+      />
     </div>
   );
 }

@@ -38,7 +38,9 @@ export function Providers({ children }: { children: ReactNode }) {
           },
         },
         externalWallets: {
-          solana: { connectors: toSolanaWalletConnectors() },
+          solana: {
+            connectors: toSolanaWalletConnectors({ shouldAutoConnect: false }),
+          },
         },
         loginMethodsAndOrder: {
           primary: ['email', 'google', 'detected_solana_wallets'],
