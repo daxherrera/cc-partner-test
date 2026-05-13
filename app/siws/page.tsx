@@ -91,18 +91,6 @@ async function parseBody(res: Response): Promise<unknown> {
   }
 }
 
-function decodeJwtClaims(token: string): Record<string, unknown> | null {
-  try {
-    const [, payload] = token.split('.');
-    if (!payload) return null;
-    const normalized = payload.replace(/-/g, '+').replace(/_/g, '/');
-    const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
-    return JSON.parse(atob(padded));
-  } catch {
-    return null;
-  }
-}
-
 async function fetchUsdcBalance(wallet: string): Promise<number> {
   const res = await fetch('/api/helius', {
     method: 'POST',
@@ -322,9 +310,15 @@ export default function SiwsPage() {
 
   const logoutSession = useCallback(async () => {
     if (!tokens) return;
+    // Pass the access token too — the server revokes both in one call so a
+    // logged-out session can't keep using the access token for the rest of
+    // its 15-min TTL.
     await fetch(`${apiUrl}/auth/wallet/logout`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokens.accessToken}`,
+      },
       body: JSON.stringify({ refreshToken: tokens.refreshToken }),
     });
     setTokens(null);
@@ -514,8 +508,6 @@ export default function SiwsPage() {
     if (tokens && wallet) loadUsdcBalance();
   }, [tokens, wallet, loadUsdcBalance]);
 
-  const decodedAccess = tokens ? decodeJwtClaims(tokens.accessToken) : null;
-
   return (
     <Shell>
       <h1 style={{ marginTop: 0 }}>CC Partner Test — Native SIWS</h1>
@@ -525,9 +517,9 @@ export default function SiwsPage() {
         <code>window.solana</code> provider) will use from inside the wallet
         UI. Connects via <code>window.solana</code>, calls{' '}
         <code>POST /auth/wallet/nonce</code> → signs the returned message →{' '}
-        <code>POST /auth/wallet/verify</code> for a CC-issued JWT. The
-        resulting access token is scoped to the routes the backend annotates
-        with <code>@WalletAuthAllowed()</code>.
+        <code>POST /auth/wallet/verify</code> for a pair of opaque,
+        server-stored access + refresh tokens. The access token is scoped to
+        the routes the backend annotates with <code>@WalletAuthAllowed()</code>.
       </p>
       <p style={{ color: '#9ca3af' }}>
         Target backend: <code>{apiUrl}</code>
@@ -652,25 +644,32 @@ export default function SiwsPage() {
               value={new Date(tokens.expiresAt).toISOString()}
             />
             <Row
-              label='Refresh token'
-              value={`${tokens.refreshToken.slice(0, 12)}…`}
+              label='Access token'
+              value={`${tokens.accessToken.slice(0, 16)}…`}
             />
-            {decodedAccess && (
-              <details style={{ marginTop: 8 }}>
-                <summary style={{ color: '#9ca3af', cursor: 'pointer' }}>
-                  Decoded access-token claims
-                </summary>
-                <pre style={preStyle}>
-                  {JSON.stringify(decodedAccess, null, 2)}
-                </pre>
-              </details>
-            )}
+            <Row
+              label='Refresh token'
+              value={`${tokens.refreshToken.slice(0, 16)}…`}
+            />
             <details style={{ marginTop: 8 }}>
               <summary style={{ color: '#9ca3af', cursor: 'pointer' }}>
                 Raw access token (copy for curl)
               </summary>
               <pre style={preStyle}>{tokens.accessToken}</pre>
             </details>
+            <p
+              style={{
+                color: '#6b7280',
+                fontSize: 12,
+                marginBottom: 0,
+                marginTop: 8,
+              }}
+            >
+              Tokens are opaque (random ids prefixed <code>cca_</code> /{' '}
+              <code>ccr_</code>). The server holds the trusted claims; the
+              token is just the lookup key. Treat it like a session cookie —
+              don&apos;t parse it client-side.
+            </p>
           </>
         )}
       </Section>
