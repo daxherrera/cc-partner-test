@@ -5,6 +5,7 @@ import {
   useIdentityToken,
   usePrivy,
 } from '@privy-io/react-auth';
+import { useWallets } from '@privy-io/react-auth/solana';
 import { useCallback, useState } from 'react';
 
 // Collector Crypt's Privy app (the global-wallet provider). Override with
@@ -71,6 +72,10 @@ export default function ConnectCcPage() {
   const { ready, authenticated, user, login, logout } = usePrivy();
   const { linkCrossAppAccount } = useCrossAppAccounts();
   const { identityToken } = useIdentityToken();
+  // Live connected Solana wallets — the cross-app CC wallet surfaces here
+  // (connectorType 'cross_app'), even when the identity token's cross_app
+  // linked account reports an empty embeddedWallets array.
+  const { wallets } = useWallets();
 
   const [linking, setLinking] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
