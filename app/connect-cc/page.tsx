@@ -138,7 +138,7 @@ function walletSnapshot(w: unknown): Record<string, unknown> {
 
 export default function ConnectCcPage() {
   const { ready, authenticated, user, login, logout } = usePrivy();
-  const { linkCrossAppAccount } = useCrossAppAccounts();
+  const { linkCrossAppAccount, unlinkCrossAppAccount } = useCrossAppAccounts();
   const { refreshUser } = useUser();
   const { identityToken } = useIdentityToken();
   // Live connected Solana wallets. NOTE: for Solana this hook filters strictly
@@ -192,6 +192,23 @@ export default function ConnectCcPage() {
       console.error('[connect-cc] refreshUser threw:', err);
     }
   }, [refreshUser]);
+
+  // Remove the linked (empty) CC account so the next link can authenticate a
+  // different CC account. NOTE: this only unlinks on the partner side — the CC
+  // provider session in the popup may still be active, so to force a fresh CC
+  // login also log out of collectorcrypt.com in this browser before re-linking.
+  const unlink = useCallback(async () => {
+    const subject = findCrossApp(returnedUser ?? user)?.subject;
+    if (!subject) return;
+    try {
+      const updated = await unlinkCrossAppAccount({ subject });
+      setReturnedUser(updated);
+      console.log('[connect-cc] unlinkCrossAppAccount returned User:', updated);
+    } catch (err) {
+      console.error('[connect-cc] unlinkCrossAppAccount threw:', err);
+      setLinkError(err instanceof Error ? err.message : String(err));
+    }
+  }, [unlinkCrossAppAccount, returnedUser, user]);
 
   const callCC = useCallback(
     async (label: string, path: string, init?: RequestInit) => {
@@ -295,9 +312,16 @@ export default function ConnectCcPage() {
         title='2. Link your Collector Crypt wallet'
         right={
           authenticated ? (
-            <Button variant='secondary' onClick={refresh}>
-              Refresh user
-            </Button>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Button variant='secondary' onClick={refresh}>
+                Refresh user
+              </Button>
+              {crossApp && (
+                <Button variant='secondary' onClick={unlink}>
+                  Unlink CC
+                </Button>
+              )}
+            </div>
           ) : undefined
         }
       >
