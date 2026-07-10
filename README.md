@@ -13,6 +13,19 @@ creates) a CC user row keyed on the wallet from the token's
 
 No app secrets are exchanged. No cross-app linking is required for API auth.
 
+### Three tracks
+
+- **`/`** — partner Privy identity token (this page).
+- **`/siws`** — native Sign-In-With-Solana (`window.solana`, no Privy).
+- **`/connect-cc`** — **Connect with Collector Crypt**: Privy global (cross-app)
+  wallets. The user clicks one button, signs in to Collector Crypt with their
+  email on Privy's hosted consent screen, and approves sharing their wallet.
+  CC's embedded wallet then arrives on this session's `cross_app` linked
+  account (`crossApp.embeddedWallets[0].address` — *not* the top-level `wallet`
+  account). Provider app id via `NEXT_PUBLIC_CC_PRIVY_APP_ID` (defaults to CC
+  production). Requires the CC app to have Global Wallets enabled and this
+  partner app authorized as a requester in the Privy dashboard.
+
 ## Auth flow at a glance
 
 ```

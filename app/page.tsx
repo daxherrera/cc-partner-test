@@ -398,6 +398,11 @@ export default function Page() {
             → Native SIWS flow (Phantom-style window.solana, no Privy)
           </a>
         </p>
+        <p style={{ color: '#9ca3af' }}>
+          <a href='/connect-cc' style={{ color: '#a5f3fc' }}>
+            → Connect with Collector Crypt (global wallet — sign in with email)
+          </a>
+        </p>
         <Button onClick={login}>Log in with Partner Privy</Button>
       </Shell>
     );
@@ -424,6 +429,11 @@ export default function Page() {
       <p style={{ color: '#9ca3af' }}>
         <a href='/siws' style={{ color: '#a5f3fc' }}>
           → Native SIWS flow (Phantom-style window.solana, no Privy)
+        </a>
+      </p>
+      <p style={{ color: '#9ca3af' }}>
+        <a href='/connect-cc' style={{ color: '#a5f3fc' }}>
+          → Connect with Collector Crypt (global wallet — sign in with email)
         </a>
       </p>
 
