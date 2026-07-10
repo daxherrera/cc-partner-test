@@ -4,6 +4,7 @@ import {
   useCrossAppAccounts,
   useIdentityToken,
   usePrivy,
+  useUser,
 } from '@privy-io/react-auth';
 import { useWallets } from '@privy-io/react-auth/solana';
 import { useCallback, useState } from 'react';
@@ -17,8 +18,10 @@ const apiUrl = (
   process.env.NEXT_PUBLIC_CC_API_URL || 'https://api.collectorcrypt.com'
 ).replace(/\/+$/, '');
 
-// The cross-app linked account Privy attaches after linking CC. The CC wallet
-// lives in `embeddedWallets` here — not the top-level `wallet` account.
+// The cross-app linked account Privy attaches after linking CC. For a Solana
+// global-wallet provider the shared wallet address lands in `embeddedWallets`
+// (chain-agnostic {address}[]). We dump the raw object so we can SEE what CC
+// actually returns instead of guessing.
 type CrossAppLinkedAccount = {
   type: 'cross_app';
   subject: string;
@@ -27,12 +30,37 @@ type CrossAppLinkedAccount = {
   smartWallets: { address: string }[];
 };
 
-function findCrossApp(
-  user: ReturnType<typeof usePrivy>['user'],
-): CrossAppLinkedAccount | undefined {
+type AnyUser = ReturnType<typeof usePrivy>['user'];
+
+function findCrossApp(user: AnyUser): CrossAppLinkedAccount | undefined {
   return user?.linkedAccounts?.find(a => a.type === 'cross_app') as
     | CrossAppLinkedAccount
     | undefined;
+}
+
+// Pull every plausible Solana address out of a cross_app account, whatever key
+// Privy tucked it under (embeddedWallets / smartWallets / a bare `wallets` /
+// walletsV2 / a top-level address). base58, 32–44 chars, no 0/O/I/l.
+const B58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+function crossAppAddresses(ca: unknown): string[] {
+  const out = new Set<string>();
+  const visit = (v: unknown, depth: number) => {
+    if (!v || depth > 4) return;
+    if (typeof v === 'string') {
+      if (B58.test(v)) out.add(v);
+      return;
+    }
+    if (Array.isArray(v)) {
+      v.forEach(x => visit(x, depth + 1));
+      return;
+    }
+    if (typeof v === 'object') {
+      for (const val of Object.values(v as Record<string, unknown>))
+        visit(val, depth + 1);
+    }
+  };
+  visit(ca, 0);
+  return [...out];
 }
 
 type CallResult =
@@ -68,35 +96,102 @@ async function parseBody(res: Response): Promise<unknown> {
   }
 }
 
+// JSON.stringify that survives circular refs, BigInt, and functions so we can
+// dump live Privy objects (wallet instances carry methods + back-refs).
+function safeStringify(value: unknown): string {
+  const seen = new WeakSet();
+  return JSON.stringify(
+    value,
+    (_k, v) => {
+      if (typeof v === 'bigint') return `${v.toString()}n`;
+      if (typeof v === 'function') return `[fn ${v.name || 'anon'}]`;
+      if (typeof v === 'object' && v !== null) {
+        if (seen.has(v)) return '[circular]';
+        seen.add(v);
+      }
+      return v;
+    },
+    2,
+  );
+}
+
+// A ConnectedStandardSolanaWallet is a class instance — its data hides behind
+// getters, so Object.keys() misses most of it. Probe the fields we care about
+// explicitly, then merge in own-enumerable keys for anything else.
+function walletSnapshot(w: unknown): Record<string, unknown> {
+  const o = w as Record<string, unknown> & {
+    standardWallet?: { name?: string };
+  };
+  const snap: Record<string, unknown> = {
+    address: o.address,
+    type: o.type,
+    chainType: o.chainType,
+    walletClientType: o.walletClientType,
+    connectorType: o.connectorType,
+    imported: o.imported,
+    delegated: o.delegated,
+    standardWalletName: o.standardWallet?.name,
+  };
+  for (const k of Object.keys(o)) if (!(k in snap)) snap[k] = o[k];
+  return snap;
+}
+
 export default function ConnectCcPage() {
   const { ready, authenticated, user, login, logout } = usePrivy();
   const { linkCrossAppAccount } = useCrossAppAccounts();
+  const { refreshUser } = useUser();
   const { identityToken } = useIdentityToken();
-  // Live connected Solana wallets — the cross-app CC wallet surfaces here
-  // (connectorType 'cross_app'), even when the identity token's cross_app
-  // linked account reports an empty embeddedWallets array.
+  // Live connected Solana wallets. NOTE: for Solana this hook filters strictly
+  // on chainType === 'solana' over connected + embedded wallets — it does NOT
+  // include cross-app accounts. The CC wallet is NOT expected here; it lives on
+  // the cross_app linked account. Dumped anyway so we can see the partner's own
+  // embedded wallet vs anything unexpected.
   const { wallets } = useWallets();
 
   const [linking, setLinking] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
   const [result, setResult] = useState<CallResult>({ status: 'idle' });
+  // The User object linkCrossAppAccount / refreshUser hand back — the freshest,
+  // most authoritative snapshot, independent of usePrivy()'s reactive `user`.
+  const [returnedUser, setReturnedUser] = useState<AnyUser>(null);
 
-  // Step 2 — link the CC wallet to the *already-authenticated* partner
-  // session. linkCrossAppAccount requires authenticated === true, so the user
-  // must complete Step 1 (partner login) first. Linking opens Collector
-  // Crypt's OAuth consent, where the user authenticates as their real CC
-  // account and approves sharing their embedded wallet.
+  // Step 2 — link the CC wallet to the *already-authenticated* partner session.
   const link = useCallback(async () => {
     setLinking(true);
     setLinkError(null);
     try {
-      await linkCrossAppAccount({ appId: CC_PRIVY_APP_ID });
+      const updated = await linkCrossAppAccount({ appId: CC_PRIVY_APP_ID });
+      setReturnedUser(updated);
+      console.log(
+        '[connect-cc] linkCrossAppAccount returned User:',
+        updated,
+        '\nlinkedAccounts:',
+        updated?.linkedAccounts,
+        '\ncross_app:',
+        findCrossApp(updated),
+      );
     } catch (err) {
+      console.error('[connect-cc] linkCrossAppAccount threw:', err);
       setLinkError(err instanceof Error ? err.message : String(err));
     } finally {
       setLinking(false);
     }
   }, [linkCrossAppAccount]);
+
+  const refresh = useCallback(async () => {
+    try {
+      const fresh = await refreshUser();
+      setReturnedUser(fresh);
+      console.log(
+        '[connect-cc] refreshUser returned User:',
+        fresh,
+        '\ncross_app:',
+        findCrossApp(fresh),
+      );
+    } catch (err) {
+      console.error('[connect-cc] refreshUser threw:', err);
+    }
+  }, [refreshUser]);
 
   const callCC = useCallback(
     async (label: string, path: string, init?: RequestInit) => {
@@ -113,13 +208,7 @@ export default function ConnectCcPage() {
           },
         });
         const body = await parseBody(res);
-        setResult({
-          status: 'done',
-          label,
-          httpStatus: res.status,
-          ok: res.ok,
-          body,
-        });
+        setResult({ status: 'done', label, httpStatus: res.status, ok: res.ok, body });
       } catch (err) {
         setResult({
           status: 'error',
@@ -131,27 +220,25 @@ export default function ConnectCcPage() {
     [identityToken],
   );
 
-  const crossApp = findCrossApp(user);
-  // ConnectedStandardSolanaWallet exposes only `address` + `standardWallet`
-  // (wallet-standard, with a `name`). A cross-app wallet reports the provider
-  // name (e.g. "Collector Crypt"); the partner's own embedded wallet reports
-  // "Privy". Prefer the linked-account embedded wallet, then a provider-named
-  // wallet from the live hook.
-  const walletName = (w: (typeof wallets)[number]) =>
-    (w as { standardWallet?: { name?: string } }).standardWallet?.name ?? '';
-  const crossAppWallet = wallets.find(w => /collector|crypt/i.test(walletName(w)));
+  // Prefer the freshest object (link/refresh return value) over the reactive one.
+  const effectiveUser = returnedUser ?? user;
+  const crossApp = findCrossApp(effectiveUser);
+  const crossAppAddrs = crossApp ? crossAppAddresses(crossApp) : [];
   const ccWallet =
-    crossApp?.embeddedWallets?.[0]?.address ?? crossAppWallet?.address;
+    crossApp?.embeddedWallets?.[0]?.address ??
+    crossApp?.smartWallets?.[0]?.address ??
+    crossAppAddrs[0];
+
   const decodedIdentity = identityToken ? decodeJwtClaims(identityToken) : null;
   const googleEmail = (
-    user?.linkedAccounts?.find(a => a.type === 'google_oauth') as
+    effectiveUser?.linkedAccounts?.find(a => a.type === 'google_oauth') as
       | { email?: string }
       | undefined
   )?.email;
   const partnerLabel =
     googleEmail ??
-    (user?.email as { address?: string } | undefined)?.address ??
-    user?.id ??
+    (effectiveUser?.email as { address?: string } | undefined)?.address ??
+    effectiveUser?.id ??
     '—';
 
   if (!ready) return <Shell>Booting Privy…</Shell>;
@@ -161,10 +248,10 @@ export default function ConnectCcPage() {
       <h1 style={{ marginTop: 0 }}>CC Partner Test — Connect Collector Crypt</h1>
       <p style={{ color: '#9ca3af' }}>
         Link a user&apos;s <strong>Collector Crypt wallet</strong> to this
-        partner app with Privy global (cross-app) wallets. Two steps: first
-        sign in to the partner app, then link Collector Crypt — linking opens
-        CC&apos;s consent screen where the user authenticates with their CC
-        account and approves sharing their embedded wallet.
+        partner app with Privy global (cross-app) wallets. Two steps: first sign
+        in to the partner app, then link Collector Crypt — linking opens CC&apos;s
+        consent screen where the user authenticates with their CC account and
+        approves sharing their embedded wallet.
       </p>
       <p style={{ color: '#9ca3af' }}>
         <a href='/' style={{ color: '#a5f3fc' }}>
@@ -191,7 +278,7 @@ export default function ConnectCcPage() {
             <div style={{ color: '#4ade80', marginBottom: 8 }}>
               ✓ Connected as <code>{partnerLabel}</code>
             </div>
-            <Row label='Partner Privy DID' value={user?.id ?? '—'} />
+            <Row label='Partner Privy DID' value={effectiveUser?.id ?? '—'} />
           </>
         ) : (
           <>
@@ -204,7 +291,16 @@ export default function ConnectCcPage() {
         )}
       </Section>
 
-      <Section title='2. Link your Collector Crypt wallet'>
+      <Section
+        title='2. Link your Collector Crypt wallet'
+        right={
+          authenticated ? (
+            <Button variant='secondary' onClick={refresh}>
+              Refresh user
+            </Button>
+          ) : undefined
+        }
+      >
         {!authenticated && (
           <div style={{ color: '#6b7280' }}>Complete step 1 first.</div>
         )}
@@ -238,43 +334,58 @@ export default function ConnectCcPage() {
               }
             />
             <Row label='CC user (subject)' value={crossApp.subject ?? '—'} />
-            <Row label='Signed-in email' value={partnerLabel} />
-            <Row label='CC wallet' value={ccWallet ?? '—'} />
-            {crossApp.smartWallets?.length > 0 && (
-              <Row
-                label='CC smart wallets'
-                value={crossApp.smartWallets.map(w => w.address).join(', ')}
-              />
-            )}
-            <details style={{ marginTop: 12 }} open>
-              <summary style={{ color: '#9ca3af', cursor: 'pointer' }}>
-                Connected wallets — useWallets() ({wallets.length})
-              </summary>
-              <pre style={preStyle}>
-                {JSON.stringify(
-                  wallets.map(w => ({
-                    address: w.address,
-                    name: walletName(w),
-                  })),
-                  null,
-                  2,
-                )}
-              </pre>
-            </details>
+            <Row label='Partner sign-in (NOT CC)' value={partnerLabel} />
+            <Row label='CC wallet' value={ccWallet ?? '— (none shared)'} />
+            <Row
+              label='embeddedWallets[]'
+              value={
+                (crossApp.embeddedWallets ?? []).map(w => w.address).join(', ') ||
+                '(empty)'
+              }
+            />
+            <Row
+              label='smartWallets[]'
+              value={
+                (crossApp.smartWallets ?? []).map(w => w.address).join(', ') ||
+                '(empty)'
+              }
+            />
+            <Row
+              label='any b58 addr found'
+              value={crossAppAddrs.join(', ') || '(none)'}
+            />
             {!ccWallet && (
               <div style={{ color: '#fbbf24', fontSize: 13, marginTop: 8 }}>
-                Linked, but no cross-app wallet surfaced yet. Check the
-                useWallets() dump above — if your CC wallet is there with
-                connectorType &quot;cross_app&quot;, it&apos;ll show as CC
-                wallet; if not, the CC OAuth authenticated the wrong account
-                (subject has no shared wallet).
+                Linked, but CC shared no wallet address. Either the CC account you
+                authenticated with has no Privy embedded wallet, or CC&apos;s
+                global-wallet sharing didn&apos;t attach it. Hit{' '}
+                <strong>Refresh user</strong>, then read the raw cross_app dump
+                below — that is the source of truth.
               </div>
             )}
           </>
         )}
       </Section>
 
-      <Section title='3. Identity token (the Bearer you send to CC)'>
+      <Section title='3. Raw debug dump (source of truth)'>
+        <Dump label={`cross_app linked account (source: ${returnedUser ? 'link/refresh return' : 'usePrivy'})`}>
+          {crossApp ? safeStringify(crossApp) : '(no cross_app account yet)'}
+        </Dump>
+        <Dump label={`user.linkedAccounts (${effectiveUser?.linkedAccounts?.length ?? 0})`}>
+          {safeStringify(effectiveUser?.linkedAccounts ?? [])}
+        </Dump>
+        <Dump label={`useWallets() — Solana connected/embedded (${wallets.length})`}>
+          {safeStringify(wallets.map(walletSnapshot))}
+        </Dump>
+        <Dump label='full user object'>
+          {safeStringify(effectiveUser)}
+        </Dump>
+        <Dump label='decoded identity token claims'>
+          {decodedIdentity ? safeStringify(decodedIdentity) : '(no identity token)'}
+        </Dump>
+      </Section>
+
+      <Section title='4. Identity token (the Bearer you send to CC)'>
         {!crossApp && <div style={{ color: '#6b7280' }}>Link first.</div>}
         {crossApp && (
           <>
@@ -282,38 +393,28 @@ export default function ConnectCcPage() {
               label='Present?'
               value={identityToken ? `yes (len ${identityToken.length})` : 'no'}
             />
-            {decodedIdentity && (
-              <details style={{ marginTop: 12 }}>
-                <summary style={{ color: '#9ca3af', cursor: 'pointer' }}>
-                  Decoded identity token claims
-                </summary>
-                <pre style={preStyle}>
-                  {JSON.stringify(decodedIdentity, null, 2)}
-                </pre>
-                {identityToken && (
-                  <button
-                    onClick={() => navigator.clipboard.writeText(identityToken)}
-                    style={{
-                      background: '#27272e',
-                      border: 'none',
-                      borderRadius: 6,
-                      color: 'white',
-                      cursor: 'pointer',
-                      fontSize: 13,
-                      marginTop: 8,
-                      padding: '6px 12px',
-                    }}
-                  >
-                    Copy raw identity token
-                  </button>
-                )}
-              </details>
+            {identityToken && (
+              <button
+                onClick={() => navigator.clipboard.writeText(identityToken)}
+                style={{
+                  background: '#27272e',
+                  border: 'none',
+                  borderRadius: 6,
+                  color: 'white',
+                  cursor: 'pointer',
+                  fontSize: 13,
+                  marginTop: 8,
+                  padding: '6px 12px',
+                }}
+              >
+                Copy raw identity token
+              </button>
             )}
           </>
         )}
       </Section>
 
-      <Section title='4. Call Collector Crypt API (optional)'>
+      <Section title='5. Call Collector Crypt API (optional)'>
         {!crossApp && <div style={{ color: '#6b7280' }}>Link first.</div>}
         {crossApp && (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
@@ -332,7 +433,7 @@ export default function ConnectCcPage() {
         )}
       </Section>
 
-      <Section title='5. Result'>
+      <Section title='6. Result'>
         <ResultView result={result} />
       </Section>
     </Shell>
@@ -391,10 +492,21 @@ function Section({
   );
 }
 
+function Dump({ label, children }: { label: string; children: string }) {
+  return (
+    <details style={{ marginBottom: 10 }} open>
+      <summary style={{ color: '#9ca3af', cursor: 'pointer', fontSize: 13 }}>
+        {label}
+      </summary>
+      <pre style={preStyle}>{children}</pre>
+    </details>
+  );
+}
+
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <div style={{ display: 'flex', fontSize: 14, padding: '4px 0' }}>
-      <div style={{ color: '#9ca3af', minWidth: 180 }}>{label}</div>
+      <div style={{ color: '#9ca3af', minWidth: 200 }}>{label}</div>
       <div
         style={{
           color: '#e5e7eb',
@@ -459,18 +571,13 @@ function ResultView({ result }: { result: CallResult }) {
 
   return (
     <div>
-      <div
-        style={{
-          color: result.ok ? '#4ade80' : '#f87171',
-          marginBottom: 8,
-        }}
-      >
+      <div style={{ color: result.ok ? '#4ade80' : '#f87171', marginBottom: 8 }}>
         {result.label} — {result.httpStatus} {result.ok ? 'OK' : 'FAIL'}
       </div>
       <pre style={preStyle}>
         {typeof result.body === 'string'
           ? result.body
-          : JSON.stringify(result.body, null, 2)}
+          : safeStringify(result.body)}
       </pre>
     </div>
   );
