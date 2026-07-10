@@ -7,6 +7,13 @@ import { ReactNode } from 'react';
 
 const appId = process.env.NEXT_PUBLIC_PARTNER_PRIVY_APP_ID ?? '';
 
+// Collector Crypt's Privy app (the global-wallet provider). Declaring it as a
+// `privy:${appId}` login method registers it as a cross-app provider — without
+// this, loginWithCrossAppAccount never invokes CC's email login and the flow
+// falls through to a blank partner-app embedded wallet.
+const ccProviderAppId =
+  process.env.NEXT_PUBLIC_CC_PRIVY_APP_ID ?? 'cmdgt21w400lgky0mkn069jui';
+
 export function Providers({ children }: { children: ReactNode }) {
   if (!appId) {
     return (
@@ -43,7 +50,12 @@ export function Providers({ children }: { children: ReactNode }) {
           },
         },
         loginMethodsAndOrder: {
-          primary: ['email', 'google', 'detected_solana_wallets'],
+          primary: [
+            `privy:${ccProviderAppId}`,
+            'email',
+            'google',
+            'detected_solana_wallets',
+          ],
         },
         solana: {
           rpcs: {
