@@ -132,9 +132,24 @@ export default function ConnectCcPage() {
   );
 
   const crossApp = findCrossApp(user);
-  const ccWallet = crossApp?.embeddedWallets?.[0]?.address;
+  // ConnectedStandardSolanaWallet exposes only `address` + `standardWallet`
+  // (wallet-standard, with a `name`). A cross-app wallet reports the provider
+  // name (e.g. "Collector Crypt"); the partner's own embedded wallet reports
+  // "Privy". Prefer the linked-account embedded wallet, then a provider-named
+  // wallet from the live hook.
+  const walletName = (w: (typeof wallets)[number]) =>
+    (w as { standardWallet?: { name?: string } }).standardWallet?.name ?? '';
+  const crossAppWallet = wallets.find(w => /collector|crypt/i.test(walletName(w)));
+  const ccWallet =
+    crossApp?.embeddedWallets?.[0]?.address ?? crossAppWallet?.address;
   const decodedIdentity = identityToken ? decodeJwtClaims(identityToken) : null;
+  const googleEmail = (
+    user?.linkedAccounts?.find(a => a.type === 'google_oauth') as
+      | { email?: string }
+      | undefined
+  )?.email;
   const partnerLabel =
+    googleEmail ??
     (user?.email as { address?: string } | undefined)?.address ??
     user?.id ??
     '—';
@@ -223,6 +238,7 @@ export default function ConnectCcPage() {
               }
             />
             <Row label='CC user (subject)' value={crossApp.subject ?? '—'} />
+            <Row label='Signed-in email' value={partnerLabel} />
             <Row label='CC wallet' value={ccWallet ?? '—'} />
             {crossApp.smartWallets?.length > 0 && (
               <Row
@@ -230,12 +246,28 @@ export default function ConnectCcPage() {
                 value={crossApp.smartWallets.map(w => w.address).join(', ')}
               />
             )}
+            <details style={{ marginTop: 12 }} open>
+              <summary style={{ color: '#9ca3af', cursor: 'pointer' }}>
+                Connected wallets — useWallets() ({wallets.length})
+              </summary>
+              <pre style={preStyle}>
+                {JSON.stringify(
+                  wallets.map(w => ({
+                    address: w.address,
+                    name: walletName(w),
+                  })),
+                  null,
+                  2,
+                )}
+              </pre>
+            </details>
             {!ccWallet && (
               <div style={{ color: '#fbbf24', fontSize: 13, marginTop: 8 }}>
-                Linked, but Collector Crypt shared no embedded wallet
-                (embeddedWallets is empty). That CC account has no Privy
-                embedded wallet to share — global wallets can only surface
-                Privy-managed embedded wallets, not external ones.
+                Linked, but no cross-app wallet surfaced yet. Check the
+                useWallets() dump above — if your CC wallet is there with
+                connectorType &quot;cross_app&quot;, it&apos;ll show as CC
+                wallet; if not, the CC OAuth authenticated the wrong account
+                (subject has no shared wallet).
               </div>
             )}
           </>
