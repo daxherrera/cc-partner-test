@@ -38,10 +38,13 @@ export function Providers({ children }: { children: ReactNode }) {
             'wallet_connect',
           ],
         },
+        // This app consumes Collector Crypt's global wallet. Do not create a
+        // second partner-owned wallet when the cross-app account has no wallet
+        // in its response; that address is unrelated to the user's CC wallet.
         embeddedWallets: {
           showWalletUIs: false,
           solana: {
-            createOnLogin: 'users-without-wallets',
+            createOnLogin: 'off',
           },
         },
         externalWallets: {
