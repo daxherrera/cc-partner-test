@@ -2,11 +2,12 @@
 
 import {
   useCrossAppAccounts,
+  useGetAccessTokenForProvider,
   useIdentityToken,
   usePrivy,
 } from '@privy-io/react-auth';
 import { useWallets } from '@privy-io/react-auth/solana';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 // Collector Crypt's Privy app (the global-wallet provider). Override with
 // NEXT_PUBLIC_CC_PRIVY_APP_ID; defaults to CC production.
@@ -74,6 +75,13 @@ type CallResult =
     }
   | { status: 'error'; label: string; message: string };
 
+type CCProviderUser = {
+  id?: string;
+  email?: string;
+  wallet?: string;
+  [key: string]: unknown;
+};
+
 function decodeJwtClaims(token: string): Record<string, unknown> | null {
   try {
     const [, payload] = token.split('.');
@@ -138,6 +146,7 @@ function walletSnapshot(w: unknown): Record<string, unknown> {
 export default function ConnectCcPage() {
   const { ready, authenticated, user, logout } = usePrivy();
   const { loginWithCrossAppAccount } = useCrossAppAccounts();
+  const { getAccessTokenForProvider } = useGetAccessTokenForProvider();
   const { identityToken } = useIdentityToken();
   // Live connected Solana wallets. NOTE: for Solana this hook filters strictly
   // on chainType === 'solana' over connected + embedded wallets — it does NOT
@@ -148,6 +157,8 @@ export default function ConnectCcPage() {
 
   const [connecting, setConnecting] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
+  const [providerUser, setProviderUser] = useState<CCProviderUser | null>(null);
+  const [providerUserError, setProviderUserError] = useState<string | null>(null);
   const [result, setResult] = useState<CallResult>({ status: 'idle' });
 
   // CC is the identity provider for this session. Starting from a logged-out
@@ -170,14 +181,15 @@ export default function ConnectCcPage() {
     async (label: string, path: string, init?: RequestInit) => {
       setResult({ status: 'pending', label });
       try {
-        if (!identityToken)
-          throw new Error('No Privy identity token yet — connect first');
+        const { token } = getAccessTokenForProvider({ appId: CC_PRIVY_APP_ID });
+        if (!token)
+          throw new Error('No Collector Crypt provider access token yet');
         const res = await fetch(`${apiUrl}${path}`, {
           ...init,
           headers: {
             'Content-Type': 'application/json',
             ...(init?.headers ?? {}),
-            Authorization: `Bearer ${identityToken}`,
+            Authorization: `Bearer ${token}`,
           },
         });
         const body = await parseBody(res);
@@ -190,16 +202,56 @@ export default function ConnectCcPage() {
         });
       }
     },
-    [identityToken],
+    [getAccessTokenForProvider],
   );
 
   const effectiveUser = user;
   const crossApp = findCrossApp(effectiveUser);
+  const crossAppSubject = crossApp?.subject;
   const crossAppAddrs = crossApp ? crossAppAddresses(crossApp) : [];
-  const ccWallet =
+  const sharedCcWallet =
     crossApp?.embeddedWallets?.[0]?.address ??
     crossApp?.smartWallets?.[0]?.address ??
     crossAppAddrs[0];
+  const ccWallet = sharedCcWallet ?? providerUser?.wallet;
+
+  // The cross_app subject (e.g. xylk…) is opaque. Exchange the cross-app
+  // session for a provider-scoped access token and let CC resolve that subject
+  // to its canonical user and wallet.
+  useEffect(() => {
+    if (!crossApp) {
+      setProviderUser(null);
+      setProviderUserError(null);
+      return;
+    }
+    const { token } = getAccessTokenForProvider({ appId: CC_PRIVY_APP_ID });
+    if (!token) {
+      setProviderUserError('Collector Crypt issued no provider access token.');
+      return;
+    }
+    let cancelled = false;
+    setProviderUserError(null);
+    fetch(`${apiUrl}/users/info`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(async res => {
+        const body = await parseBody(res);
+        if (!res.ok)
+          throw new Error(
+            `Collector Crypt rejected its provider token (${res.status}): ${
+              typeof body === 'string' ? body : JSON.stringify(body)
+            }`,
+          );
+        if (!cancelled) setProviderUser(body as CCProviderUser);
+      })
+      .catch(err => {
+        if (!cancelled)
+          setProviderUserError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [crossAppSubject, getAccessTokenForProvider]);
 
   const decodedIdentity = identityToken ? decodeJwtClaims(identityToken) : null;
   const googleEmail = (
@@ -291,6 +343,17 @@ export default function ConnectCcPage() {
             <Row label='Session identity' value={partnerLabel} />
             <Row label='CC wallet' value={ccWallet ?? '— (none shared)'} />
             <Row
+              label='Wallet source'
+              value={
+                sharedCcWallet
+                  ? 'Privy shared embedded wallet'
+                  : providerUser?.wallet
+                    ? 'Collector Crypt /users/info'
+                    : '—'
+              }
+            />
+            <Row label='CC API user' value={providerUser?.id ?? '—'} />
+            <Row
               label='embeddedWallets[]'
               value={
                 (crossApp.embeddedWallets ?? []).map(w => w.address).join(', ') ||
@@ -314,6 +377,11 @@ export default function ConnectCcPage() {
                 Read the raw cross_app dump below to verify the provider response.
               </div>
             )}
+            {providerUserError && (
+              <div style={{ color: '#f87171', fontSize: 13, marginTop: 8 }}>
+                {providerUserError}
+              </div>
+            )}
           </>
         )}
       </Section>
@@ -333,6 +401,9 @@ export default function ConnectCcPage() {
         </Dump>
         <Dump label='decoded identity token claims'>
           {decodedIdentity ? safeStringify(decodedIdentity) : '(no identity token)'}
+        </Dump>
+        <Dump label='Collector Crypt provider user (/users/info)'>
+          {providerUser ? safeStringify(providerUser) : '(not resolved)'}
         </Dump>
       </Section>
 
