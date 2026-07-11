@@ -252,14 +252,14 @@ export default function ConnectCcPage() {
     }
     let cancelled = false;
     setProviderUserError(null);
-    fetch(`${apiUrl}/users/info`, {
+    fetch('/api/cc-provider/user', {
       headers: { Authorization: `Bearer ${token}` },
     })
       .then(async res => {
         const body = await parseBody(res);
         if (!res.ok)
           throw new Error(
-            `Collector Crypt rejected its provider token (${res.status}): ${
+            `Collector Crypt provider lookup failed (${res.status}): ${
               typeof body === 'string' ? body : JSON.stringify(body)
             }`,
           );
