@@ -4,7 +4,6 @@ import {
   useCrossAppAccounts,
   useIdentityToken,
   usePrivy,
-  useUser,
 } from '@privy-io/react-auth';
 import { useWallets } from '@privy-io/react-auth/solana';
 import { useCallback, useState } from 'react';
@@ -18,7 +17,7 @@ const apiUrl = (
   process.env.NEXT_PUBLIC_CC_API_URL || 'https://api.collectorcrypt.com'
 ).replace(/\/+$/, '');
 
-// The cross-app linked account Privy attaches after linking CC. For a Solana
+// The cross-app linked account Privy attaches after signing in with CC. For a Solana
 // global-wallet provider the shared wallet address lands in `embeddedWallets`
 // (chain-agnostic {address}[]). We dump the raw object so we can SEE what CC
 // actually returns instead of guessing.
@@ -137,9 +136,8 @@ function walletSnapshot(w: unknown): Record<string, unknown> {
 }
 
 export default function ConnectCcPage() {
-  const { ready, authenticated, user, login, logout } = usePrivy();
-  const { linkCrossAppAccount, unlinkCrossAppAccount } = useCrossAppAccounts();
-  const { refreshUser } = useUser();
+  const { ready, authenticated, user, logout } = usePrivy();
+  const { loginWithCrossAppAccount } = useCrossAppAccounts();
   const { identityToken } = useIdentityToken();
   // Live connected Solana wallets. NOTE: for Solana this hook filters strictly
   // on chainType === 'solana' over connected + embedded wallets — it does NOT
@@ -148,67 +146,25 @@ export default function ConnectCcPage() {
   // embedded wallet vs anything unexpected.
   const { wallets } = useWallets();
 
-  const [linking, setLinking] = useState(false);
-  const [linkError, setLinkError] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const [connectError, setConnectError] = useState<string | null>(null);
   const [result, setResult] = useState<CallResult>({ status: 'idle' });
-  // The User object linkCrossAppAccount / refreshUser hand back — the freshest,
-  // most authoritative snapshot, independent of usePrivy()'s reactive `user`.
-  const [returnedUser, setReturnedUser] = useState<AnyUser>(null);
 
-  // Step 2 — link the CC wallet to the *already-authenticated* partner session.
-  const link = useCallback(async () => {
-    setLinking(true);
-    setLinkError(null);
+  // CC is the identity provider for this session. Starting from a logged-out
+  // state avoids attempting to attach an existing CC identity to a separate
+  // partner identity, which Privy correctly rejects as an account collision.
+  const connect = useCallback(async () => {
+    setConnecting(true);
+    setConnectError(null);
     try {
-      const updated = await linkCrossAppAccount({ appId: CC_PRIVY_APP_ID });
-      setReturnedUser(updated);
-      console.log(
-        '[connect-cc] linkCrossAppAccount returned User:',
-        updated,
-        '\nlinkedAccounts:',
-        updated?.linkedAccounts,
-        '\ncross_app:',
-        findCrossApp(updated),
-      );
+      await loginWithCrossAppAccount({ appId: CC_PRIVY_APP_ID });
     } catch (err) {
-      console.error('[connect-cc] linkCrossAppAccount threw:', err);
-      setLinkError(err instanceof Error ? err.message : String(err));
+      console.error('[connect-cc] loginWithCrossAppAccount threw:', err);
+      setConnectError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLinking(false);
+      setConnecting(false);
     }
-  }, [linkCrossAppAccount]);
-
-  const refresh = useCallback(async () => {
-    try {
-      const fresh = await refreshUser();
-      setReturnedUser(fresh);
-      console.log(
-        '[connect-cc] refreshUser returned User:',
-        fresh,
-        '\ncross_app:',
-        findCrossApp(fresh),
-      );
-    } catch (err) {
-      console.error('[connect-cc] refreshUser threw:', err);
-    }
-  }, [refreshUser]);
-
-  // Remove the linked (empty) CC account so the next link can authenticate a
-  // different CC account. NOTE: this only unlinks on the partner side — the CC
-  // provider session in the popup may still be active, so to force a fresh CC
-  // login also log out of collectorcrypt.com in this browser before re-linking.
-  const unlink = useCallback(async () => {
-    const subject = findCrossApp(returnedUser ?? user)?.subject;
-    if (!subject) return;
-    try {
-      const updated = await unlinkCrossAppAccount({ subject });
-      setReturnedUser(updated);
-      console.log('[connect-cc] unlinkCrossAppAccount returned User:', updated);
-    } catch (err) {
-      console.error('[connect-cc] unlinkCrossAppAccount threw:', err);
-      setLinkError(err instanceof Error ? err.message : String(err));
-    }
-  }, [unlinkCrossAppAccount, returnedUser, user]);
+  }, [loginWithCrossAppAccount]);
 
   const callCC = useCallback(
     async (label: string, path: string, init?: RequestInit) => {
@@ -237,8 +193,7 @@ export default function ConnectCcPage() {
     [identityToken],
   );
 
-  // Prefer the freshest object (link/refresh return value) over the reactive one.
-  const effectiveUser = returnedUser ?? user;
+  const effectiveUser = user;
   const crossApp = findCrossApp(effectiveUser);
   const crossAppAddrs = crossApp ? crossAppAddresses(crossApp) : [];
   const ccWallet =
@@ -264,11 +219,10 @@ export default function ConnectCcPage() {
     <Shell>
       <h1 style={{ marginTop: 0 }}>CC Partner Test — Connect Collector Crypt</h1>
       <p style={{ color: '#9ca3af' }}>
-        Link a user&apos;s <strong>Collector Crypt wallet</strong> to this
-        partner app with Privy global (cross-app) wallets. Two steps: first sign
-        in to the partner app, then link Collector Crypt — linking opens CC&apos;s
-        consent screen where the user authenticates with their CC account and
-        approves sharing their embedded wallet.
+        Connect a user&apos;s <strong>Collector Crypt wallet</strong> to this
+        partner app with Privy global (cross-app) wallets. Collector Crypt&apos;s
+        consent screen authenticates the user with their CC account and shares
+        their existing embedded wallet into the partner session.
       </p>
       <p style={{ color: '#9ca3af' }}>
         <a href='/' style={{ color: '#a5f3fc' }}>
@@ -281,7 +235,7 @@ export default function ConnectCcPage() {
       </p>
 
       <Section
-        title='1. Connect to the partner app'
+        title='1. Connect with Collector Crypt'
         right={
           authenticated ? (
             <Button variant='secondary' onClick={() => logout()}>
@@ -290,65 +244,41 @@ export default function ConnectCcPage() {
           ) : undefined
         }
       >
-        {authenticated ? (
-          <>
-            <div style={{ color: '#4ade80', marginBottom: 8 }}>
-              ✓ Connected as <code>{partnerLabel}</code>
-            </div>
-            <Row label='Partner Privy DID' value={effectiveUser?.id ?? '—'} />
-          </>
-        ) : (
-          <>
-            <p style={{ color: '#9ca3af', marginTop: 0 }}>
-              linkCrossAppAccount requires an authenticated session, so sign in
-              to the partner app first (email, Google, or a wallet).
-            </p>
-            <Button onClick={login}>Connect to partner app</Button>
-          </>
-        )}
-      </Section>
-
-      <Section
-        title='2. Link your Collector Crypt wallet'
-        right={
-          authenticated ? (
-            <div style={{ display: 'flex', gap: 8 }}>
-              <Button variant='secondary' onClick={refresh}>
-                Refresh user
-              </Button>
-              {crossApp && (
-                <Button variant='secondary' onClick={unlink}>
-                  Unlink CC
-                </Button>
-              )}
-            </div>
-          ) : undefined
-        }
-      >
-        {!authenticated && (
-          <div style={{ color: '#6b7280' }}>Complete step 1 first.</div>
+        {crossApp && (
+          <div style={{ color: '#4ade80', marginBottom: 8 }}>
+            ✓ Signed in with Collector Crypt.
+          </div>
         )}
         {authenticated && !crossApp && (
           <>
             <p style={{ color: '#9ca3af', marginTop: 0 }}>
-              Provider app: <code>{CC_PRIVY_APP_ID}</code>. Calls{' '}
-              <code>linkCrossAppAccount({'{ appId }'})</code> → Collector
-              Crypt&apos;s consent screen. Sign in there with your CC account so
-              the right wallet is shared.
+              This browser is already signed in to the partner app as{' '}
+              <code>{partnerLabel}</code>. Log out before connecting so Collector
+              Crypt becomes the identity provider for this session.
             </p>
-            <Button onClick={link}>
-              {linking ? 'Opening Collector Crypt…' : 'Link Collector Crypt'}
-            </Button>
-            {linkError && (
-              <div style={{ color: '#f87171', marginTop: 12 }}>{linkError}</div>
-            )}
+            <Button onClick={() => logout()}>Log out to connect CC</Button>
           </>
         )}
-        {authenticated && crossApp && (
+        {!authenticated && (
           <>
-            <div style={{ color: '#4ade80', marginBottom: 8 }}>
-              ✓ Collector Crypt linked.
-            </div>
+            <p style={{ color: '#9ca3af', marginTop: 0 }}>
+              Sign in to Collector Crypt with your email and approve access to
+              your existing CC wallet.
+            </p>
+            <Button onClick={connect}>
+              {connecting ? 'Opening Collector Crypt…' : 'Connect with Collector Crypt'}
+            </Button>
+          </>
+        )}
+        {connectError && (
+          <div style={{ color: '#f87171', marginTop: 12 }}>{connectError}</div>
+        )}
+      </Section>
+
+      <Section title='2. Connected Collector Crypt account'>
+        {!crossApp && <div style={{ color: '#6b7280' }}>Not connected yet.</div>}
+        {crossApp && (
+          <>
             <Row
               label='Provider'
               value={
@@ -358,7 +288,7 @@ export default function ConnectCcPage() {
               }
             />
             <Row label='CC user (subject)' value={crossApp.subject ?? '—'} />
-            <Row label='Partner sign-in (NOT CC)' value={partnerLabel} />
+            <Row label='Session identity' value={partnerLabel} />
             <Row label='CC wallet' value={ccWallet ?? '— (none shared)'} />
             <Row
               label='embeddedWallets[]'
@@ -380,11 +310,8 @@ export default function ConnectCcPage() {
             />
             {!ccWallet && (
               <div style={{ color: '#fbbf24', fontSize: 13, marginTop: 8 }}>
-                Linked, but CC shared no wallet address. Either the CC account you
-                authenticated with has no Privy embedded wallet, or CC&apos;s
-                global-wallet sharing didn&apos;t attach it. Hit{' '}
-                <strong>Refresh user</strong>, then read the raw cross_app dump
-                below — that is the source of truth.
+                Collector Crypt authenticated, but shared no wallet address.
+                Read the raw cross_app dump below to verify the provider response.
               </div>
             )}
           </>
@@ -392,7 +319,7 @@ export default function ConnectCcPage() {
       </Section>
 
       <Section title='3. Raw debug dump (source of truth)'>
-        <Dump label={`cross_app linked account (source: ${returnedUser ? 'link/refresh return' : 'usePrivy'})`}>
+        <Dump label='cross_app linked account (source: usePrivy)'>
           {crossApp ? safeStringify(crossApp) : '(no cross_app account yet)'}
         </Dump>
         <Dump label={`user.linkedAccounts (${effectiveUser?.linkedAccounts?.length ?? 0})`}>
@@ -410,7 +337,7 @@ export default function ConnectCcPage() {
       </Section>
 
       <Section title='4. Identity token (the Bearer you send to CC)'>
-        {!crossApp && <div style={{ color: '#6b7280' }}>Link first.</div>}
+        {!crossApp && <div style={{ color: '#6b7280' }}>Connect first.</div>}
         {crossApp && (
           <>
             <Row
@@ -439,7 +366,7 @@ export default function ConnectCcPage() {
       </Section>
 
       <Section title='5. Call Collector Crypt API (optional)'>
-        {!crossApp && <div style={{ color: '#6b7280' }}>Link first.</div>}
+        {!crossApp && <div style={{ color: '#6b7280' }}>Connect first.</div>}
         {crossApp && (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
             <Button onClick={() => callCC('GET /users/info', '/users/info')}>
