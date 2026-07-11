@@ -145,7 +145,8 @@ function walletSnapshot(w: unknown): Record<string, unknown> {
 
 export default function ConnectCcPage() {
   const { ready, authenticated, user, logout } = usePrivy();
-  const { loginWithCrossAppAccount } = useCrossAppAccounts();
+  const { loginWithCrossAppAccount, unlinkCrossAppAccount } =
+    useCrossAppAccounts();
   const { getAccessTokenForProvider } = useGetAccessTokenForProvider();
   const { identityToken } = useIdentityToken();
   // Live connected Solana wallets. NOTE: for Solana this hook filters strictly
@@ -156,6 +157,7 @@ export default function ConnectCcPage() {
   const { wallets } = useWallets();
 
   const [connecting, setConnecting] = useState(false);
+  const [unlinking, setUnlinking] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
   const [providerUser, setProviderUser] = useState<CCProviderUser | null>(null);
   const [providerUserError, setProviderUserError] = useState<string | null>(null);
@@ -176,6 +178,25 @@ export default function ConnectCcPage() {
       setConnecting(false);
     }
   }, [loginWithCrossAppAccount]);
+
+  const unlinkAndRetry = useCallback(async () => {
+    const subject = findCrossApp(user)?.subject;
+    if (!subject) return;
+    setUnlinking(true);
+    setConnectError(null);
+    try {
+      await unlinkCrossAppAccount({ subject });
+      await logout();
+      setProviderUser(null);
+      setProviderUserError(null);
+      setResult({ status: 'idle' });
+    } catch (err) {
+      console.error('[connect-cc] unlinkCrossAppAccount threw:', err);
+      setConnectError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setUnlinking(false);
+    }
+  }, [logout, unlinkCrossAppAccount, user]);
 
   const callCC = useCallback(
     async (label: string, path: string, init?: RequestInit) => {
@@ -289,7 +310,11 @@ export default function ConnectCcPage() {
       <Section
         title='1. Connect with Collector Crypt'
         right={
-          authenticated ? (
+          crossApp ? (
+            <Button variant='secondary' onClick={unlinkAndRetry}>
+              {unlinking ? 'Unlinking…' : 'Unlink CC and retry'}
+            </Button>
+          ) : authenticated ? (
             <Button variant='secondary' onClick={() => logout()}>
               Log out
             </Button>
